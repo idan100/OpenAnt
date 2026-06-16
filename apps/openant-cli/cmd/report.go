@@ -45,6 +45,7 @@ var (
 	reportPipelineOutput string
 	reportRepoName       string
 	reportExtraDest      string
+	reportLLMConfig      string
 )
 
 func init() {
@@ -54,6 +55,7 @@ func init() {
 	reportCmd.Flags().StringVar(&reportPipelineOutput, "pipeline-output", "", "Path to pipeline_output.json (for summary/disclosure)")
 	reportCmd.Flags().StringVar(&reportRepoName, "repo-name", "", "Repository name (used when auto-building pipeline_output)")
 	reportCmd.Flags().StringVar(&reportExtraDest, "copy-to", "", "Copy reports to an additional location")
+	reportCmd.Flags().StringVar(&reportLLMConfig, "llm-config", "", "Name of the llm-config in ~/.config/openant/config.json (defaults to the file's default_llm, or the built-in 'openant-default' if no config file exists).")
 }
 
 // isInteractive returns true if stdin is a terminal and we're not in quiet mode.
@@ -307,10 +309,7 @@ func promptExtraLocation(scanDir string) (string, error) {
 // then renders the HTML template.
 func runHTMLReport(rt *python.RuntimeInfo, resultsPath string, outputPath string) error {
 	// 1. Call Python report-data to get pre-computed JSON
-	pyArgs := []string{"report-data", resultsPath}
-	if reportDataset != "" {
-		pyArgs = append(pyArgs, "--dataset", reportDataset)
-	}
+	pyArgs := buildReportDataArgs(resultsPath)
 
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, resolvedAPIKey())
 	if err != nil {
@@ -366,7 +365,27 @@ func buildReportArgs(resultsPath string, format string) []string {
 	if reportRepoName != "" {
 		pyArgs = append(pyArgs, "--repo-name", reportRepoName)
 	}
+	if reportLLMConfig != "" {
+		pyArgs = append(pyArgs, "--llm-config", reportLLMConfig)
+	}
 
+	return pyArgs
+}
+
+// buildReportDataArgs constructs the Python CLI arguments for the internal
+// report-data subcommand (the HTML renderer's data source). The HTML
+// remediation block rides the report phase, so the report command's
+// --llm-config must be forwarded here exactly as buildReportArgs does for
+// the summary/disclosure formats — otherwise --llm-config is silently
+// ignored for HTML-report remediation.
+func buildReportDataArgs(resultsPath string) []string {
+	pyArgs := []string{"report-data", resultsPath}
+	if reportDataset != "" {
+		pyArgs = append(pyArgs, "--dataset", reportDataset)
+	}
+	if reportLLMConfig != "" {
+		pyArgs = append(pyArgs, "--llm-config", reportLLMConfig)
+	}
 	return pyArgs
 }
 

@@ -38,10 +38,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-import anthropic
-
 from .llm_client import TokenTracker, get_global_tracker
-from .rate_limiter import get_rate_limiter
+from .llm import (
+    LLMRateLimitError,
+    Message,
+    PhaseBinding,
+    TextBlock,
+    ToolDef,
+    ToolResultBlock,
+    ToolUseBlock,
+    lookup_pricing,
+)
 
 # Null logger that discards all messages (used when no logger provided)
 _null_logger = logging.getLogger("null_verifier")
@@ -62,7 +69,6 @@ except ImportError:
     ApplicationContext = None
 
 
-VERIFIER_MODEL = "claude-opus-4-6"
 MAX_ITERATIONS = 20
 MAX_TOKENS_PER_RESPONSE = 4096
 
@@ -221,6 +227,16 @@ class VerificationResult:
     total_tokens: int
     exploit_path: Optional[ExploitPath] = None
     security_weakness: Optional[str] = None
+    # First-class "incomplete verification" state (PR #69 F4/F5). True on the
+    # four degenerate fail-safe paths (unparseable text, no tool calls, max
+    # iterations, finish-without-agree) where Stage 2 could NOT COMPLETE a
+    # verdict. Distinct from a genuine disagreement: those paths keep
+    # ``agree=False`` + ``correct_finding=finding`` (the Stage-1 verdict is
+    # preserved, the finding stays surfaced), but downstream consumers must
+    # NOT read ``agree=False`` here as "Stage 2 actively rejected". This flag
+    # lets the reporter render "unverified" (not "rejected") and lets the
+    # metrics bucket it as needs-review (not "safe").
+    incomplete: bool = False
 
     def to_dict(self) -> dict:
         result = {
@@ -234,6 +250,9 @@ class VerificationResult:
             result["exploit_path"] = self.exploit_path.to_dict()
         if self.security_weakness:
             result["security_weakness"] = self.security_weakness
+        # Always serialize the incomplete flag so downstream consumers
+        # (core/reporter.py, core/verifier.py) can branch on it explicitly.
+        result["incomplete"] = self.incomplete
         return result
 
 
@@ -260,20 +279,36 @@ class FindingVerifier:
     def __init__(
         self,
         index: RepositoryIndex,
+        binding: PhaseBinding,
         tracker: TokenTracker = None,
         verbose: bool = False,
         app_context: "ApplicationContext" = None,
         logger: logging.Logger = None,
-        client: "anthropic.Anthropic | None" = None,
     ):
+        if not binding.adapter.supports_tools:
+            raise ValueError(
+                f"Stage 2 verification requires a tool-supporting adapter, "
+                f"but the binding for phase {binding.phase!r} uses adapter "
+                f"type {binding.adapter.name!r} which does not support tools."
+            )
         self.index = index
+        self.binding = binding
         self.tracker = tracker or get_global_tracker()
         self.verbose = verbose
         self.app_context = app_context
         self.tool_executor = ToolExecutor(index)
-        self.client = client or anthropic.Anthropic(max_retries=5)
         self.logger = logger or _null_logger
         self._use_logger = logger is not None
+
+        # Build typed tool defs once per verifier instance.
+        self._tool_defs: list[ToolDef] = [
+            ToolDef(
+                name=td["name"],
+                description=td["description"],
+                input_schema=td["input_schema"],
+            )
+            for td in VERIFICATION_TOOLS
+        ]
 
     def _log(self, level: str, msg: str, **extras):
         """Log a message, using logger if available, otherwise print if verbose."""
@@ -318,7 +353,9 @@ class FindingVerifier:
         # Get system prompt with app context if available
         system_prompt = get_verification_system_prompt(self.app_context)
 
-        messages = [{"role": "user", "content": user_prompt}]
+        messages: list[Message] = [
+            Message(role="user", content=[TextBlock(user_prompt)])
+        ]
         iterations = 0
         total_input_tokens = 0
         total_output_tokens = 0
@@ -328,26 +365,17 @@ class FindingVerifier:
 
             self._log("debug", f"Iteration {iterations}", iterations=iterations)
 
-            # Wait if we're in a global backoff period
-            rate_limiter = get_rate_limiter()
-            rate_limiter.wait_if_needed()
+            # Adapter handles the rate-limiter wait/report dance internally.
+            response = self.binding.adapter.complete(
+                model=self.binding.model,
+                max_tokens=MAX_TOKENS_PER_RESPONSE,
+                system=system_prompt,
+                tools=self._tool_defs,
+                messages=messages,
+            )
 
-            try:
-                response = self.client.messages.create(
-                    model=VERIFIER_MODEL,
-                    max_tokens=MAX_TOKENS_PER_RESPONSE,
-                    system=system_prompt,
-                    tools=VERIFICATION_TOOLS,
-                    messages=messages
-                )
-            except anthropic.RateLimitError as exc:
-                # Report to global rate limiter so all workers back off
-                retry_after = float(exc.response.headers.get("retry-after", 0))
-                get_rate_limiter().report_rate_limit(retry_after)
-                raise
-
-            total_input_tokens += response.usage.input_tokens
-            total_output_tokens += response.usage.output_tokens
+            total_input_tokens += response.input_tokens
+            total_output_tokens += response.output_tokens
 
             assistant_content = response.content
             stop_reason = response.stop_reason
@@ -361,21 +389,30 @@ class FindingVerifier:
                 if result:
                     return result
 
-                # Default: agree with Stage 1
+                # Fail-safe (R4-7): a degenerate path must NOT auto-agree with
+                # Stage 1 (that reads downstream as "Verification agreed" — a
+                # silent rubber-stamp for a security verifier). Mark agree=False
+                # so it never reads as agreed/clean, but PRESERVE the Stage-1
+                # verdict in correct_finding so the finding stays surfaced:
+                # the agree=False consumer (:644-651, experiment.py:775-778)
+                # sets result["finding"] = correct_finding, and the report
+                # filters on that field — using "inconclusive" here would drop
+                # a Stage-1 "vulnerable" from the report entirely.
                 return VerificationResult(
-                    agree=True,
+                    agree=False,
                     correct_finding=finding,
                     explanation="Verification incomplete",
                     iterations=iterations,
-                    total_tokens=total_input_tokens + total_output_tokens
+                    total_tokens=total_input_tokens + total_output_tokens,
+                    incomplete=True,
                 )
 
             # Process tool calls
-            tool_results = []
+            tool_results: list[ToolResultBlock] = []
             finish_result = None
 
             for block in assistant_content:
-                if block.type == "tool_use":
+                if isinstance(block, ToolUseBlock):
                     tool_name = block.name
                     tool_input = block.input
                     tool_use_id = block.id
@@ -384,46 +421,80 @@ class FindingVerifier:
 
                     if tool_name == "finish":
                         finish_result = tool_input
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": json.dumps({"status": "complete"})
-                        })
+                        tool_results.append(
+                            ToolResultBlock(
+                                tool_use_id=tool_use_id,
+                                name=tool_name,
+                                content=json.dumps({"status": "complete"}),
+                            )
+                        )
                         break
                     else:
-                        result = self.tool_executor.execute(tool_name, tool_input)
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": json.dumps(result)
-                        })
+                        outcome = self.tool_executor.execute(tool_name, tool_input)
+                        tool_results.append(
+                            ToolResultBlock(
+                                tool_use_id=tool_use_id,
+                                name=tool_name,
+                                content=json.dumps(outcome),
+                            )
+                        )
 
             if finish_result:
                 self.tracker.record_call(
-                    model=VERIFIER_MODEL,
+                    model=self.binding.model,
                     input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens
+                    output_tokens=total_output_tokens,
+                    pricing=lookup_pricing(self.binding),
                 )
                 return self._parse_finish_result(
                     finish_result, finding, iterations,
                     total_input_tokens + total_output_tokens
                 )
 
-            messages.append({"role": "assistant", "content": assistant_content})
-            messages.append({"role": "user", "content": tool_results})
+            # Echo only the block kinds the loop consumes (Text + ToolUse);
+            # a future 4th block kind would otherwise throw when the next
+            # turn re-serializes the assistant history.
+            echoed = [b for b in assistant_content if isinstance(b, (TextBlock, ToolUseBlock))]
+            messages.append(Message(role="assistant", content=echoed))
+            # Mirror the enhancer's guard: an empty tool_results turn (the
+            # model truncated at max_tokens / stop_sequence before any tool
+            # call) would send an empty-content user message, which the next
+            # complete() rejects. Treat it as verification-incomplete.
+            if not tool_results:
+                self.tracker.record_call(
+                    model=self.binding.model,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    pricing=lookup_pricing(self.binding),
+                )
+                # Fail-safe (R4-7): see the :380 path above. Don't auto-agree;
+                # keep the Stage-1 verdict surfaced for human triage.
+                return VerificationResult(
+                    agree=False,
+                    correct_finding=finding,
+                    explanation="Verification incomplete (no tool calls)",
+                    iterations=iterations,
+                    total_tokens=total_input_tokens + total_output_tokens,
+                    incomplete=True,
+                )
+            messages.append(Message(role="user", content=list(tool_results)))
 
         # Max iterations reached
         self.tracker.record_call(
-            model=VERIFIER_MODEL,
+            model=self.binding.model,
             input_tokens=total_input_tokens,
-            output_tokens=total_output_tokens
+            output_tokens=total_output_tokens,
+            pricing=lookup_pricing(self.binding),
         )
+        # Fail-safe (R4-7): exhausting the iteration budget is not agreement.
+        # Don't auto-agree; keep the Stage-1 verdict surfaced for human triage.
         return VerificationResult(
-            agree=True,
+            agree=False,
             correct_finding=finding,
             explanation="Max iterations reached",
             iterations=iterations,
-            total_tokens=total_input_tokens + total_output_tokens
+            total_tokens=total_input_tokens + total_output_tokens,
+            incomplete=True,
         )
 
     def verify_batch(
@@ -613,7 +684,21 @@ class FindingVerifier:
 
         except Exception as e:
             detail = "error"
-            print(f"[Verify] ERROR {route_key}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            # L4 (PR #69 round-5): record the error ON the result dict, not just
+            # in the local ``detail``. The downstream counter (core/verifier.py)
+            # buckets on ``r.get("error")``; without this the errored finding
+            # falls through to "disagreed" and is folded into the ``safe`` count.
+            # Fail-safe: an adapter raise (e.g. R4-1/R4-2 empty/refusal) must
+            # NEVER read as safe — it is unverified and needs manual review.
+            err_msg = f"{type(e).__name__}: {e}"
+            result["error"] = err_msg
+            # Surface a minimal verification dict marked incomplete so any
+            # consumer that branches on ``verification.incomplete`` also treats
+            # it as needs-review rather than a clean verdict.
+            result.setdefault("verification", {})
+            result["verification"]["incomplete"] = True
+            result["verification_note"] = f"Verification errored: {err_msg}"
+            print(f"[Verify] ERROR {route_key}: {err_msg}", file=sys.stderr, flush=True)
 
         unit_elapsed = time.monotonic() - unit_start
         usage = self.tracker.get_unit_usage()
@@ -830,25 +915,16 @@ class FindingVerifier:
         prompt = get_consistency_check_prompt(group, code_by_route)
 
         try:
-            # Wait if we're in a global backoff period
-            rate_limiter = get_rate_limiter()
-            rate_limiter.wait_if_needed()
+            # Adapter handles rate-limit coordination internally.
+            from .llm import simple_text
 
-            response = self.client.messages.create(
-                model=VERIFIER_MODEL,
-                max_tokens=MAX_TOKENS_PER_RESPONSE,
+            text = simple_text(
+                self.binding,
+                prompt,
                 system="You are checking verdict consistency across similar code patterns.",
-                messages=[{"role": "user", "content": prompt}]
+                max_tokens=MAX_TOKENS_PER_RESPONSE,
+                tracker=self.tracker,
             )
-
-            self.tracker.record_call(
-                model=VERIFIER_MODEL,
-                input_tokens=response.usage.input_tokens,
-                output_tokens=response.usage.output_tokens
-            )
-
-            # Parse response
-            text = response.content[0].text if response.content else ""
             result = self._parse_json_from_text(text)
 
             if result:
@@ -859,10 +935,8 @@ class FindingVerifier:
                     explanation=result.get("explanation", "")
                 )
 
-        except anthropic.RateLimitError as e:
-            # Report to global rate limiter so all workers back off
-            retry_after = float(e.response.headers.get("retry-after", 0))
-            get_rate_limiter().report_rate_limit(retry_after)
+        except LLMRateLimitError as e:
+            # Adapter already reported the 429; just log it locally.
             self._log("error", f"Consistency resolution rate limited", error=str(e))
         except Exception as e:
             self._log("error", f"Consistency resolution failed", error=str(e))
@@ -889,14 +963,28 @@ class FindingVerifier:
                 path_broken_at=ep.get("path_broken_at")
             )
 
+        # Fail-safe (R4-7): a `finish` call that omits `agree` must NOT
+        # default to agreement — an absent field is not a confirmed verdict.
+        # Default to False so it can never silently read as "Verification
+        # agreed"; correct_finding still falls back to the Stage-1 verdict,
+        # keeping the finding surfaced.
+        #
+        # F4/F5: an absent `agree` is the fourth degenerate path — the model
+        # finished without asserting a verdict, so the verification did NOT
+        # COMPLETE. Mark it incomplete so downstream reads "unverified" /
+        # needs-review rather than "rejected" / "safe". A finish call that DOES
+        # carry `agree` (True or False) is a real, completed verdict and stays
+        # incomplete=False.
+        agree_missing = "agree" not in finish_result
         return VerificationResult(
-            agree=finish_result.get("agree", True),
+            agree=finish_result.get("agree", False),
             correct_finding=finish_result.get("correct_finding", original_finding),
             explanation=finish_result.get("explanation", ""),
             iterations=iterations,
             total_tokens=total_tokens,
             exploit_path=exploit_path,
-            security_weakness=finish_result.get("security_weakness")
+            security_weakness=finish_result.get("security_weakness"),
+            incomplete=agree_missing,
         )
 
     def _try_parse_text_response(
@@ -909,13 +997,14 @@ class FindingVerifier:
     ) -> Optional[VerificationResult]:
         """Try to parse a text response as JSON."""
         for block in assistant_content:
-            if hasattr(block, 'text'):
+            if isinstance(block, TextBlock):
                 result = self._parse_json_from_text(block.text)
                 if result:
                     self.tracker.record_call(
-                        model=VERIFIER_MODEL,
+                        model=self.binding.model,
                         input_tokens=total_input_tokens,
-                        output_tokens=total_output_tokens
+                        output_tokens=total_output_tokens,
+                        pricing=lookup_pricing(self.binding),
                     )
                     return self._parse_finish_result(
                         result, original_finding, iterations,
@@ -937,7 +1026,7 @@ class FindingVerifier:
         if text.strip():
             try:
                 from utilities.json_corrector import JSONCorrector
-                corrector = JSONCorrector(self.client)
+                corrector = JSONCorrector(self.binding)
                 corrected = corrector.attempt_correction(text)
                 if corrected.get("verdict") != "ERROR":
                     corrected["json_corrected"] = True

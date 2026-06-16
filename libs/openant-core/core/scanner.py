@@ -50,7 +50,7 @@ def scan_repository(
     generate_report: bool = True,
     skip_tests: bool = True,
     limit: int | None = None,
-    model: str = "opus",
+    llm_config_name: str | None = None,
     enhance: bool = True,
     enhance_mode: str = "agentic",
     dynamic_test: bool = False,
@@ -86,7 +86,6 @@ def scan_repository(
         generate_report: If True, generate summary + disclosure reports.
         skip_tests: If True, exclude test files from parsing (default: True).
         limit: Max number of units to analyze.
-        model: ``"opus"`` or ``"sonnet"``.
         enhance: If True, run agentic/single-shot context enhancement.
         enhance_mode: ``"agentic"`` (thorough) or ``"single-shot"`` (fast).
         dynamic_test: If True, run Docker-isolated dynamic testing (requires Docker).
@@ -102,6 +101,24 @@ def scan_repository(
 
     # Reset tracking
     tracking.reset_tracking()
+
+    # Build the registry once at scan start. Sub-steps reuse it, so
+    # a single --llm-config controls every phase without each step
+    # re-reading the config file or having to thread the name through.
+    # ``probe_registry_or_raise`` runs a 1-token probe per unique
+    # (provider, model) pair before any expensive work begins, so bad
+    # keys / typo'd model IDs / unreachable endpoints surface here as
+    # a clean LLMError rather than mid-scan.
+    from utilities.llm import (
+        build_phase_registry,
+        load_config_file,
+        probe_registry_or_raise,
+        resolve_llm_config,
+    )
+    cf = load_config_file()
+    registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+    print(f"[Scan] LLM config: {registry.config_name}", file=sys.stderr)
+    probe_registry_or_raise(registry)
 
     result = ScanResult(output_dir=output_dir)
     collected_step_reports: list[dict] = []
@@ -197,7 +214,9 @@ def scan_repository(
             "repo_path": repo_path,
         }) as ctx:
             try:
-                context = generate_application_context(Path(repo_path))
+                context = generate_application_context(
+                    Path(repo_path), registry.get("app_context")
+                )
                 app_context_path = os.path.join(output_dir, "application_context.json")
                 save_context(context, Path(app_context_path))
                 result.app_context_path = app_context_path
@@ -234,17 +253,18 @@ def scan_repository(
     # look for HTTP handlers").
     if llm_reachability:
         from core.llm_reachability import (
-            MODEL_PRIMARY as _LLM_REACH_MODEL,
             analyze_reachability,
             apply_signals,
             signals_to_json,
         )
 
+        llm_reach_binding = registry.get("llm_reach")
         print(_step_label("Running LLM reachability review..."), file=sys.stderr)
 
         with step_context("llm-reachability", output_dir, inputs={
             "dataset_path": active_dataset_path,
-            "model": _LLM_REACH_MODEL,
+            "model": llm_reach_binding.model,
+            "provider": llm_reach_binding.provider_name,
         }) as ctx:
             try:
                 dataset = read_json(active_dataset_path)
@@ -267,6 +287,7 @@ def scan_repository(
                 signals = analyze_reachability(
                     dataset=dataset,
                     app_context=app_ctx_payload,
+                    binding=llm_reach_binding,
                     max_code_bytes=llm_reachability_max_code_bytes,
                 )
                 summary = apply_signals(dataset, signals)
@@ -369,6 +390,7 @@ def scan_repository(
                 analyzer_output_path=parse_result.analyzer_output_path,
                 repo_path=repo_path,
                 mode=enhance_mode,
+                registry=registry,
                 workers=workers,
                 backoff_seconds=backoff_seconds,
                 # checkpoint_path auto-derived from output_path
@@ -406,9 +428,11 @@ def scan_repository(
 
     print(_step_label("Running vulnerability detection (Stage 1)..."), file=sys.stderr)
 
+    analyze_binding = registry.get("analyze")
     with step_context("analyze", output_dir, inputs={
         "dataset_path": active_dataset_path,
-        "model": model,
+        "model": analyze_binding.model,
+        "provider": analyze_binding.provider_name,
         "limit": limit,
     }) as ctx:
         analyze_result = run_analysis(
@@ -418,7 +442,7 @@ def scan_repository(
             app_context_path=app_context_path,
             repo_path=repo_path,
             limit=limit,
-            model=model,
+            registry=registry,
             workers=workers,
             backoff_seconds=backoff_seconds,
         )
@@ -470,6 +494,7 @@ def scan_repository(
                 repo_path=repo_path,
                 workers=workers,
                 backoff_seconds=backoff_seconds,
+                registry=registry,
             )
 
             ctx.summary = {
@@ -478,6 +503,8 @@ def scan_repository(
                 "agreed": verify_result.agreed,
                 "disagreed": verify_result.disagreed,
                 "confirmed_vulnerabilities": verify_result.confirmed_vulnerabilities,
+                "needs_review": verify_result.needs_review,
+                "error_count": verify_result.error_count,
             }
             ctx.outputs = {
                 "verified_results_path": verify_result.verified_results_path,
@@ -489,8 +516,17 @@ def scan_repository(
 
         print(f"  Confirmed: {verify_result.confirmed_vulnerabilities} vulnerabilities",
               file=sys.stderr)
+        if verify_result.needs_review:
+            print(f"  Needs manual review: {verify_result.needs_review} "
+                  f"(verification incomplete)", file=sys.stderr)
 
-        # Update metrics from verified results
+        # Update metrics from verified results.
+        #
+        # PR #69 F5: ONLY genuine Stage-2 disagreements (verdict downgraded)
+        # fold into ``safe``. Findings whose verification could not COMPLETE
+        # (``needs_review``) or that errored (``error_count``) must NOT inflate
+        # ``safe`` — they are preserved Stage-1 potential vulnerabilities
+        # awaiting manual review. Errors stay in the ``errors`` bucket.
         result.metrics = AnalysisMetrics(
             total=analyze_result.metrics.total,
             vulnerable=verify_result.confirmed_vulnerabilities,
@@ -498,10 +534,11 @@ def scan_repository(
             inconclusive=analyze_result.metrics.inconclusive,
             protected=analyze_result.metrics.protected,
             safe=analyze_result.metrics.safe + verify_result.disagreed,
-            errors=analyze_result.metrics.errors,
+            errors=analyze_result.metrics.errors + verify_result.error_count,
             verified=verify_result.findings_verified,
             stage2_agreed=verify_result.agreed,
             stage2_disagreed=verify_result.disagreed,
+            needs_review=verify_result.needs_review,
         )
     elif verify and not has_findings:
         print(_step_label("Skipping verification (no vulnerable findings)."),
@@ -564,6 +601,7 @@ def scan_repository(
                 dt_result = run_tests(
                     pipeline_output_path=pipeline_output_path,
                     output_dir=output_dir,
+                    registry=registry,
                 )
 
                 ctx.summary = {
@@ -794,6 +832,11 @@ def _print_summary(result: ScanResult) -> None:
     print(f"  Protected:      {result.metrics.protected}", file=sys.stderr)
     print(f"  Safe:           {result.metrics.safe}", file=sys.stderr)
     print(f"  Inconclusive:   {result.metrics.inconclusive}", file=sys.stderr)
+    # PR #69 F5: surface findings whose Stage-2 verification could not complete
+    # so they read distinctly from "safe" in the headline summary.
+    if result.metrics.needs_review:
+        print(f"  Needs review:   {result.metrics.needs_review} "
+              f"(verification incomplete)", file=sys.stderr)
     print(f"  Errors:         {result.metrics.errors}", file=sys.stderr)
     if result.metrics.verified:
         print(f"  Verified:       {result.metrics.verified} "

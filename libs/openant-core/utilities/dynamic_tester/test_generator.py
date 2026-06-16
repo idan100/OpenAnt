@@ -14,9 +14,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from utilities.llm_client import AnthropicClient, TokenTracker
-
-SONNET_MODEL = "claude-sonnet-4-20250514"
+from utilities.llm_client import TokenTracker
+from utilities.llm import PhaseBinding, simple_text
 
 # Map language strings to Dockerfile template names
 LANGUAGE_MAP = {
@@ -210,6 +209,7 @@ def _parse_generation_response(raw: str) -> dict:
 def generate_test(
     finding: dict,
     repo_info: dict,
+    binding: PhaseBinding,
     tracker: TokenTracker = None,
 ) -> dict | None:
     """Generate a dynamic test for a single finding.
@@ -217,6 +217,7 @@ def generate_test(
     Args:
         finding: Finding dict from pipeline_output.json
         repo_info: Repository info (name, language, application_type)
+        binding: Phase binding for the dynamic_test phase.
         tracker: Optional TokenTracker for cost tracking
 
     Returns:
@@ -225,10 +226,11 @@ def generate_test(
         None if generation fails.
     """
     tracker = tracker or TokenTracker()
-    client = AnthropicClient(model=SONNET_MODEL, tracker=tracker)
 
     prompt = _build_finding_prompt(finding, repo_info)
-    raw = client.analyze_sync(prompt, max_tokens=8192, system=SYSTEM_PROMPT)
+    raw = simple_text(
+        binding, prompt, max_tokens=8192, system=SYSTEM_PROMPT, tracker=tracker,
+    )
 
     parsed = _parse_generation_response(raw)
     if not parsed:
@@ -247,6 +249,7 @@ def regenerate_test(
     repo_info: dict,
     previous_generation: dict,
     error_message: str,
+    binding: PhaseBinding,
     tracker: TokenTracker = None,
 ) -> dict | None:
     """Regenerate a test after a build/run failure, feeding the error back to the LLM.
@@ -256,13 +259,13 @@ def regenerate_test(
         repo_info: Repository info
         previous_generation: The generation that failed
         error_message: The Docker build/run error message
+        binding: Phase binding for the dynamic_test phase.
         tracker: Optional TokenTracker
 
     Returns:
         New generation dict, or None if regeneration fails.
     """
     tracker = tracker or TokenTracker()
-    client = AnthropicClient(model=SONNET_MODEL, tracker=tracker)
 
     original_prompt = _build_finding_prompt(finding, repo_info)
 
@@ -285,7 +288,9 @@ def regenerate_test(
         f"- Application-level errors: check the error details and fix the test logic"
     )
 
-    raw = client.analyze_sync(retry_prompt, max_tokens=8192, system=SYSTEM_PROMPT)
+    raw = simple_text(
+        binding, retry_prompt, max_tokens=8192, system=SYSTEM_PROMPT, tracker=tracker,
+    )
 
     parsed = _parse_generation_response(raw)
     if not parsed:
@@ -298,10 +303,15 @@ def regenerate_test(
     return parsed
 
 
-def _generate_one(finding, repo_info, tracker):
-    """Generate a test for a single finding, tracking cost."""
+def _generate_one(finding, repo_info, binding, tracker):
+    """Generate a test for a single finding, tracking cost.
+
+    ``binding`` precedes ``tracker`` to match :func:`generate_test`'s
+    signature — previously this passed ``tracker`` straight into the
+    ``binding`` positional, which mis-bound the call.
+    """
     cost_before = tracker.total_cost_usd
-    result = generate_test(finding, repo_info, tracker)
+    result = generate_test(finding, repo_info, binding, tracker)
     cost_after = tracker.total_cost_usd
     cost = cost_after - cost_before
     worker = threading.current_thread().name
@@ -311,6 +321,7 @@ def _generate_one(finding, repo_info, tracker):
 def generate_tests_batch(
     findings: list[dict],
     repo_info: dict,
+    binding: PhaseBinding,
     tracker: TokenTracker = None,
     workers: int = 10,
 ) -> list[tuple[dict, dict | None, float]]:
@@ -321,6 +332,8 @@ def generate_tests_batch(
     Args:
         findings: List of finding dicts
         repo_info: Repository info
+        binding: Phase binding for the dynamic_test phase. Threaded
+            through to :func:`generate_test` for every finding.
         tracker: Optional TokenTracker
         workers: Number of parallel workers (default: 10).
 
@@ -336,7 +349,7 @@ def generate_tests_batch(
     if workers <= 1:
         results = []
         for i, finding in enumerate(findings):
-            _finding, result, cost, _worker = _generate_one(finding, repo_info, tracker)
+            _finding, result, cost, _worker = _generate_one(finding, repo_info, binding, tracker)
             print(f"[DynamicTest] {i+1}/{total}  ${cost:.2f}", file=sys.stderr, flush=True)
             results.append((_finding, result, cost))
         return results
@@ -345,7 +358,7 @@ def generate_tests_batch(
     results = []
     completed = 0
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(_generate_one, finding, repo_info, tracker) for finding in findings]
+        futures = [executor.submit(_generate_one, finding, repo_info, binding, tracker) for finding in findings]
         for future in as_completed(futures):
             _finding, result, cost, worker = future.result()
             completed += 1

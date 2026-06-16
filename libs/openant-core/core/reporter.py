@@ -87,6 +87,34 @@ _FENCE_LANG = {
 }
 
 
+def _coerce_to_str(value) -> str:
+    """Convert a model-returned field to a plain string.
+
+    Pipeline prompts (``prompts/vulnerability_analysis.py``,
+    ``prompts/verification_prompts.py``) request string-typed fields
+    like ``attack_vector`` and ``verification_explanation``. Different
+    providers honor that schema with varying fidelity — Claude
+    reliably returns strings, while GPT-4o sometimes structures the
+    same field as a dict (``{"type": "...", "description": "..."}``)
+    or a nested object.
+
+    Rather than crash on the next ``.join`` or string concatenation
+    when a model strays, coerce defensively at every consumption
+    site. Strings pass through. ``None`` becomes ``""``. Dicts/lists
+    get ``json.dumps``-serialised. Anything else falls back to
+    ``str()``. The result is always safe to feed into ``.join`` or
+    concatenation.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def _build_vulnerable_code_section(file_path: str, code: str, language: str | None) -> str:
     """Build a pre-rendered Markdown `## Vulnerable Code` section.
 
@@ -271,20 +299,48 @@ def build_pipeline_output(
 
         steps_to_reproduce = vuln.get("steps_to_reproduce")
         if not steps_to_reproduce:
+            # Some non-Anthropic models return structured objects where the
+            # prompt asked for strings. Coerce defensively so a stray dict
+            # in attack_vector / verification_explanation / data_flow
+            # doesn't crash report generation. See ``_coerce_to_str``.
             parts = []
             if finding.get("attack_vector"):
-                parts.append(finding["attack_vector"])
+                parts.append(_coerce_to_str(finding["attack_vector"]))
             exploit_path = finding.get("exploit_path") or {}
-            if exploit_path.get("data_flow"):
-                parts.append("Data flow: " + " -> ".join(exploit_path["data_flow"]))
+            data_flow = exploit_path.get("data_flow")
+            if data_flow:
+                # ``data_flow`` is meant to be ``list[str]`` (verify
+                # schema), but a model can violate that. Coerce the
+                # CONTAINER first — only join step-by-step when it really
+                # is a sequence; otherwise coerce the whole value. A bare
+                # iterate-and-join here would crash on a scalar, char-walk
+                # a bare string, and drop a dict's values. See M3.
+                if isinstance(data_flow, (list, tuple)):
+                    flow_str = " -> ".join(_coerce_to_str(step) for step in data_flow)
+                else:
+                    flow_str = _coerce_to_str(data_flow)
+                parts.append("Data flow: " + flow_str)
             if finding.get("verification_explanation"):
-                parts.append("Verification: " + finding["verification_explanation"])
+                parts.append("Verification: " + _coerce_to_str(finding["verification_explanation"]))
             steps_to_reproduce = "\n\n".join(parts) if parts else None
 
-        # Determine stage2 verdict
+        # Determine stage2 verdict.
+        #
+        # PR #69 F4: distinguish an INCOMPLETE verification from a genuine
+        # rejection. R4-7 made the verifier fail-safe — on its four degenerate
+        # paths (unparseable text / no tool calls / max iterations / finish
+        # without `agree`) and on an adapter raise it returns ``agree=False``
+        # but preserves the Stage-1 verdict and flags ``incomplete=True``.
+        # ``agree=False`` alone is ambiguous: it can mean "Stage 2 disagreed"
+        # OR "Stage 2 could not complete". Mapping the latter to "rejected" is
+        # wrong (verify never rejected) and silently drops it from disclosures.
+        # Map incomplete → "unverified" so it renders distinctly and stays
+        # disclosure-eligible (surfaced for manual review).
         verification = finding.get("verification", {})
         if verification.get("agree", False):
             stage2_verdict = "confirmed" if finding.get("exploit_path") else "agreed"
+        elif verification.get("incomplete"):
+            stage2_verdict = "unverified"
         elif verification:
             stage2_verdict = "rejected"
         else:
@@ -445,6 +501,7 @@ def generate_csv_report(
 def generate_summary_report(
     results_path: str,
     output_path: str,
+    llm_config_name: str | None = None,
 ) -> ReportResult:
     """Generate LLM-based summary report (Markdown).
 
@@ -453,6 +510,9 @@ def generate_summary_report(
     Args:
         results_path: Path to pipeline_output.json or results JSON.
         output_path: Path for the output Markdown file.
+        llm_config_name: Name of the llm-config to use. ``None`` falls
+            through to the file's ``default_llm`` (or the built-in
+            ``openant-default``).
 
     Returns:
         ReportResult with the output path and usage info.
@@ -460,6 +520,12 @@ def generate_summary_report(
     import json
     from report.generator import generate_summary_report as _generate_summary, merge_dynamic_results
     from report.schema import validate_pipeline_output, ValidationError
+    from utilities.llm import (
+        build_phase_registry,
+        load_config_file,
+        probe_registry_or_raise,
+        resolve_llm_config,
+    )
 
     print("[Report] Generating summary report (LLM)...", file=sys.stderr)
 
@@ -472,7 +538,15 @@ def generate_summary_report(
     except ValidationError as e:
         raise RuntimeError(f"Invalid pipeline output: {e}")
 
-    report_text, usage = _generate_summary(pipeline_data)
+    # Resolve the report-phase binding once and pass it through.
+    # ``generate_summary_report`` is always invoked standalone via
+    # ``openant report -f summary`` — no upstream scanner has
+    # pre-validated the registry, so probe it here.
+    cf = load_config_file()
+    registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+    probe_registry_or_raise(registry)
+    report_binding = registry.get("report")
+    report_text, usage = _generate_summary(pipeline_data, report_binding)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open_utf8(output_path, "w") as f:
@@ -482,7 +556,7 @@ def generate_summary_report(
     print(f"  Cost: ${usage['cost_usd']:.4f} ({usage['total_tokens']:,} tokens)", file=sys.stderr)
 
     # Record in global tracker so step_context picks it up
-    _record_usage_in_tracker(usage)
+    _record_usage_in_tracker(usage, report_binding)
 
     return ReportResult(output_path=output_path, format="summary", usage=_usage_to_info(usage))
 
@@ -490,6 +564,7 @@ def generate_summary_report(
 def generate_disclosure_docs(
     results_path: str,
     output_dir: str,
+    llm_config_name: str | None = None,
 ) -> ReportResult:
     """Generate per-vulnerability disclosure documents.
 
@@ -498,6 +573,8 @@ def generate_disclosure_docs(
     Args:
         results_path: Path to pipeline_output.json or results JSON.
         output_dir: Directory for disclosure Markdown files.
+        llm_config_name: Name of the llm-config to use. ``None`` falls
+            through to the file's ``default_llm``.
 
     Returns:
         ReportResult with the output directory path and usage info.
@@ -506,6 +583,12 @@ def generate_disclosure_docs(
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from report.generator import generate_disclosure as _generate_disclosure, _merge_usage, merge_dynamic_results
     from report.schema import validate_pipeline_output, ValidationError
+    from utilities.llm import (
+        build_phase_registry,
+        load_config_file,
+        probe_registry_or_raise,
+        resolve_llm_config,
+    )
 
     print("[Report] Generating disclosure documents (LLM)...", file=sys.stderr)
 
@@ -520,14 +603,31 @@ def generate_disclosure_docs(
 
     os.makedirs(output_dir, exist_ok=True)
 
+    # Resolve the report-phase binding once and reuse across the
+    # ThreadPoolExecutor — adapters are stateless dispatchers, safe
+    # to share. Probe the registry upfront (standalone-invocation
+    # path; same rationale as generate_summary_report).
+    cf = load_config_file()
+    registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+    probe_registry_or_raise(registry)
+    report_binding = registry.get("report")
+
     product_name = pipeline_data["repository"]["name"]
     all_usages = []
     count = 0
 
-    # Collect confirmed findings first
+    # Collect findings eligible for a disclosure document.
+    #
+    # PR #69 F4: include "unverified" alongside the confirmed verdicts. An
+    # "unverified" finding is a Stage-1 potential vulnerability whose Stage-2
+    # verification could NOT COMPLETE (degenerate path or adapter error). It is
+    # NOT a rejection — fail-safe, it must be SURFACED for manual review, not
+    # silently dropped. Generating its disclosure (clearly stamped via the
+    # ``stage2_verdict`` the disclosure prompt reads) keeps it on the triage
+    # radar. "rejected" stays excluded (Stage 2 actively downgraded it).
     confirmed = [
         (i, finding) for i, finding in enumerate(pipeline_data["findings"], 1)
-        if finding.get("stage2_verdict") in ("confirmed", "agreed", "vulnerable")
+        if finding.get("stage2_verdict") in ("confirmed", "agreed", "vulnerable", "unverified")
     ]
 
     if not confirmed:
@@ -538,7 +638,7 @@ def generate_disclosure_docs(
 
         def _one(args):
             i, finding = args
-            disclosure_text, usage = _generate_disclosure(finding, product_name)
+            disclosure_text, usage = _generate_disclosure(finding, product_name, report_binding)
             safe_name = finding["short_name"].replace(" ", "_").upper()
             filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"
             filepath = os.path.join(output_dir, filename)
@@ -568,22 +668,30 @@ def generate_disclosure_docs(
     print(f"  Cost: ${merged_usage['cost_usd']:.4f} ({merged_usage['total_tokens']:,} tokens)", file=sys.stderr)
 
     # Record in global tracker so step_context picks it up
-    _record_usage_in_tracker(merged_usage)
+    _record_usage_in_tracker(merged_usage, report_binding)
 
     return ReportResult(output_path=output_dir, format="disclosure", usage=_usage_to_info(merged_usage))
 
 
-def _record_usage_in_tracker(usage: dict):
-    """Record usage in the global TokenTracker so step_context captures it."""
+def _record_usage_in_tracker(usage: dict, binding):
+    """Record usage in the global TokenTracker so step_context captures it.
+
+    The ``binding`` is the report-phase :class:`PhaseBinding` that
+    produced the tokens. Both the recorded ``model`` and the cost
+    rate must come from it — hardcoding either would lie when the
+    report phase is configured against anything other than opus.
+    """
     try:
+        from utilities.llm import lookup_pricing
         from utilities.llm_client import get_global_tracker
         tracker = get_global_tracker()
         # Record as a single aggregated call
         if usage.get("total_tokens", 0) > 0:
             tracker.record_call(
-                model="claude-opus-4-6",
+                model=binding.model,
                 input_tokens=usage["input_tokens"],
                 output_tokens=usage["output_tokens"],
+                pricing=lookup_pricing(binding),
             )
     except Exception:
         pass  # Best effort — don't break report generation

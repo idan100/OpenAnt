@@ -20,6 +20,12 @@ from core.checkpoint import StepCheckpoint
 from core.progress import ProgressReporter
 
 from utilities.llm_client import TokenTracker, get_global_tracker
+from utilities.llm import (
+    PhaseRegistry,
+    build_phase_registry,
+    load_config_file,
+    resolve_llm_config,
+)
 from utilities.file_io import read_json, write_json
 from utilities.finding_verifier import FindingVerifier
 from utilities.agentic_enhancer.repository_index import load_index_from_file
@@ -42,6 +48,8 @@ def run_verification(
     workers: int = 8,
     checkpoint_path: str | None = None,
     backoff_seconds: int = 30,
+    registry: PhaseRegistry | None = None,
+    llm_config_name: str | None = None,
 ) -> VerifyResult:
     """Run Stage 2 attacker-simulation verification on Stage 1 results.
 
@@ -130,10 +138,23 @@ def run_verification(
     if not code_by_route:
         code_by_route = _build_code_by_route(all_results)
 
+    # Resolve the verify-phase binding from the registry.
+    # Standalone-invocation path validates upfront; scanner-driven
+    # calls trust the scanner's probe.
+    if registry is None:
+        from utilities.llm import probe_registry_or_raise
+
+        cf = load_config_file()
+        registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+        probe_registry_or_raise(registry)
+    verify_binding = registry.get("verify")
+    print(f"[Verify] Provider: {verify_binding.provider_name}, Model: {verify_binding.model}", file=sys.stderr)
+
     # Run Stage 2 verification via verify_batch
     tracker = get_global_tracker()
     verifier = FindingVerifier(
         index=index,
+        binding=verify_binding,
         tracker=tracker,
         verbose=False,
         app_context=app_context,
@@ -169,26 +190,16 @@ def run_verification(
 
     progress.finish()
 
-    # Count outcomes
-    agreed = 0
-    disagreed = 0
-    confirmed_vulnerabilities = 0
-    error_count = 0
-
-    for r in verified_results:
-        if r.get("error"):
-            error_count += 1
-            continue
-        verification = r.get("verification", {})
-        if verification.get("agree", False):
-            agreed += 1
-            finding = r.get("finding", "").lower()
-            if finding in ("vulnerable", "bypassable"):
-                confirmed_vulnerabilities += 1
-        else:
-            disagreed += 1
+    # Count outcomes (see _count_verification_outcomes for the bucketing rules).
+    _counts = _count_verification_outcomes(verified_results)
+    agreed = _counts["agreed"]
+    disagreed = _counts["disagreed"]
+    confirmed_vulnerabilities = _counts["confirmed_vulnerabilities"]
+    needs_review = _counts["needs_review"]
+    error_count = _counts["error_count"]
 
     print(f"\n[Verify] Results: {agreed} agreed, {disagreed} disagreed, "
+          f"{needs_review} need manual review, "
           f"{confirmed_vulnerabilities} confirmed vulnerabilities", file=sys.stderr)
     if error_count:
         print(f"[Verify] Errors: {error_count}", file=sys.stderr)
@@ -225,8 +236,54 @@ def run_verification(
         agreed=agreed,
         disagreed=disagreed,
         confirmed_vulnerabilities=confirmed_vulnerabilities,
+        needs_review=needs_review,
+        error_count=error_count,
         usage=tracking.get_usage(),
     )
+
+
+def _count_verification_outcomes(verified_results: list) -> dict:
+    """Bucket verified results into agreed / disagreed / needs_review / error.
+
+    PR #69 F5/L4 — the four buckets are mutually exclusive and, crucially,
+    keep "incomplete" and "errored" findings OUT of the path that the scanner
+    later folds into ``safe`` (``safe += disagreed``):
+
+      * ``error``        — ``result["error"]`` is set (adapter raised; L4). The
+                           verification could not run; never read as safe.
+      * ``needs_review`` — verification ran but could NOT COMPLETE
+                           (``verification.incomplete``). A preserved Stage-1
+                           potential vuln awaiting manual triage.
+      * ``agreed``       — Stage 2 completed and agreed; if the final finding is
+                           vulnerable/bypassable it is a confirmed vulnerability.
+      * ``disagreed``    — Stage 2 completed and actively disagreed (e.g.
+                           downgraded the verdict). ONLY this bucket is safe to
+                           fold into ``safe`` downstream.
+    """
+    counts = {
+        "agreed": 0,
+        "disagreed": 0,
+        "needs_review": 0,
+        "confirmed_vulnerabilities": 0,
+        "error_count": 0,
+    }
+    for r in verified_results:
+        if r.get("error"):
+            counts["error_count"] += 1
+            continue
+        verification = r.get("verification", {})
+        if verification.get("incomplete"):
+            # Could not complete — needs manual review, NOT a disagreement.
+            counts["needs_review"] += 1
+            continue
+        if verification.get("agree", False):
+            counts["agreed"] += 1
+            finding = r.get("finding", "").lower()
+            if finding in ("vulnerable", "bypassable"):
+                counts["confirmed_vulnerabilities"] += 1
+        else:
+            counts["disagreed"] += 1
+    return counts
 
 
 def _write_verified_results(
