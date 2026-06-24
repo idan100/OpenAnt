@@ -67,22 +67,29 @@ class GlobalRateLimiter:
 
         Call this before every API request. Returns the time waited (0 if none).
         """
-        with self._lock:
-            now = time.monotonic()
-            if now >= self._backoff_until:
-                return 0.0
+        total_wait = 0.0
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                if now >= self._backoff_until:
+                    break
 
-            wait_time = self._backoff_until - now
-            # Add jitter (0-2s) to prevent thundering herd when backoff expires
-            jitter = random.uniform(0, 2.0)
-            total_wait = wait_time + jitter
+                wait_time = self._backoff_until - now
+                # Add jitter (0-2s) to prevent thundering herd when backoff expires
+                jitter = random.uniform(0, 2.0)
+                this_wait = wait_time + jitter
 
-        # Sleep outside the lock so other threads can also read backoff_until
-        time.sleep(total_wait)
+            # Sleep outside the lock so other threads can also read backoff_until.
+            # Re-check after sleeping: another worker may have EXTENDED _backoff_until
+            # (a fresh 429 via report_rate_limit) while we slept. Without the re-check we
+            # would wake into the still-active backoff window and re-trigger the storm.
+            time.sleep(this_wait)
+            total_wait += this_wait
 
-        with self._lock:
-            self._total_waits += 1
-            self._total_wait_time += total_wait
+        if total_wait > 0.0:
+            with self._lock:
+                self._total_waits += 1
+                self._total_wait_time += total_wait
 
         return total_wait
 
@@ -236,8 +243,17 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
         
         return False
     
-    # String-based error checking
+    # String-based error checking.
+    # NOTE: the analyzer detection path (core/analyzer.py) stores the raw
+    # str(e) of an exception rather than a structured dict, so an Anthropic
+    # HTTP 529 surfaces here as e.g.
+    #   "Error code: 529 - {...'type':'overloaded_error'...}"
+    # 529 ("overloaded") is the most common transient Anthropic failure under
+    # load and is a 5xx, so it must be retried. The structured dict branch
+    # above already retries it via status_code >= 500; mirror that here so the
+    # string path is not silently non-retryable.
     error_str = str(error_info).lower()
     return any(term in error_str for term in (
-        "rate_limit", "connection", "timeout", "500", "502", "503", "504"
+        "rate_limit", "connection", "timeout",
+        "500", "502", "503", "504", "529", "overloaded",
     ))

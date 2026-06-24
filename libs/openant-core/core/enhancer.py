@@ -37,6 +37,7 @@ def enhance_dataset(
     llm_config_name: str | None = None,
     workers: int = 8,
     backoff_seconds: int = 30,
+    limit: int | None = None,
 ) -> EnhanceResult:
     """Enhance a parsed dataset with security context.
 
@@ -46,7 +47,7 @@ def enhance_dataset(
         analyzer_output_path: Path to analyzer_output.json (required for agentic mode).
         repo_path: Path to the repository (required for agentic mode).
         mode: "agentic" (thorough, tool-use) or "single-shot" (fast, cheaper).
-        checkpoint_path: Path to save/resume checkpoint (agentic mode only).
+        checkpoint_path: Path to save/resume checkpoint (both modes).
             If None, auto-derived from output_path.
         registry: Pre-built PhaseRegistry. Scanners pass theirs;
             standalone callers leave this None and a registry is
@@ -55,6 +56,7 @@ def enhance_dataset(
             None. ``None`` falls through to the active config.
         workers: Number of parallel workers (default: 8).
         backoff_seconds: Seconds to wait on rate limit before retry (default: 30).
+        limit: Max number of units to enhance (None = all). Mirrors `analyze --limit`.
 
     Returns:
         EnhanceResult with output path, stats, and usage.
@@ -75,8 +77,11 @@ def enhance_dataset(
     print(f"[Enhance] Mode: {mode}", file=sys.stderr)
     print(f"[Enhance] Provider: {binding.provider_name}, Model: {binding.model}", file=sys.stderr)
 
-    # Auto-derive checkpoint path for agentic mode
-    if mode == "agentic" and checkpoint_path is None:
+    # Auto-derive checkpoint path for BOTH modes so single-shot also resumes
+    # after an interrupt / cost-cap instead of reprocessing every unit
+    # Single-shot is the cheap, high-volume mode, so wasted
+    # re-enhancement there is the most costly to lose.
+    if checkpoint_path is None:
         output_dir = os.path.dirname(os.path.abspath(output_path))
         checkpoint_path = os.path.join(output_dir, "enhance_checkpoints")
 
@@ -91,6 +96,9 @@ def enhance_dataset(
     print(f"[Enhance] Loading dataset: {dataset_path}", file=sys.stderr)
     dataset = read_json(dataset_path)
     units = dataset.get("units", [])
+    if limit:
+        units = units[:limit]
+        dataset["units"] = units  # so the agentic/single-shot paths enhance only these
     print(f"[Enhance] Units to enhance: {len(units)}", file=sys.stderr)
 
     # Set up progress reporter
@@ -125,6 +133,7 @@ def enhance_dataset(
             dataset,
             progress_callback=_on_unit_done,
             workers=workers,
+            checkpoint_path=checkpoint_path,
         )
     else:
         raise ValueError(f"Unknown enhancement mode: {mode}. Use 'agentic' or 'single-shot'.")

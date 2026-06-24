@@ -42,7 +42,9 @@ from tree_sitter import Language, Parser
 from utilities.file_io import read_json, write_json, open_utf8
 
 
-PHP_LANGUAGE = Language(ts_php.language_php())
+# Use the tagless grammar variant: function bodies are re-parsed WITHOUT their <?php tag (func_data
+# ['code'] is tag-stripped), and language_php() treats tagless input as inert 'text' (0 call nodes).
+PHP_LANGUAGE = Language(ts_php.language_php_only())
 
 # PHP builtins and common functions to filter out
 PHP_BUILTINS = {
@@ -85,6 +87,15 @@ PHP_BUILTINS = {
     'array_chunk', 'array_column', 'array_pad',
     'array_intersect', 'array_diff', 'range',
     'call_user_func', 'call_user_func_array',
+}
+
+# Higher-order builtins whose callback argument is a real call edge. Maps builtin name -> the 0-based
+# position of the callback argument. The outer builtin call is still filtered (it is in PHP_BUILTINS);
+# we additionally resolve the callback it dispatches to.
+CALLBACK_BUILTINS = {
+    'call_user_func': 0, 'call_user_func_array': 0,
+    'array_map': 0, 'array_filter': 1, 'array_walk': 1, 'array_reduce': 1,
+    'usort': 1, 'uasort': 1, 'uksort': 1, 'preg_replace_callback': 1,
 }
 
 # PHP keywords to skip in regex fallback
@@ -153,7 +164,7 @@ class CallGraphBuilder:
 
     def _is_builtin(self, name: str) -> bool:
         """Check if name is a PHP builtin or common function."""
-        return name in PHP_BUILTINS
+        return name.lower() in PHP_BUILTINS  # PHP function names are case-insensitive
 
     def _extract_calls_from_code(self, code: str, caller_id: str) -> Set[str]:
         """Extract function call references from code using tree-sitter."""
@@ -161,6 +172,7 @@ class CallGraphBuilder:
         caller_file = caller_id.split(':')[0]
         caller_func = self.functions.get(caller_id, {})
         caller_class = caller_func.get('class_name')
+        caller_namespace = caller_func.get('namespace_name')
 
         code_bytes = code.encode('utf-8', errors='replace')
         try:
@@ -172,8 +184,9 @@ class CallGraphBuilder:
         while stack:
             node = stack.pop()
             if node.type in ('function_call_expression', 'member_call_expression',
-                             'scoped_call_expression'):
-                resolved = self._resolve_call_node(node, code_bytes, caller_file, caller_class)
+                             'scoped_call_expression', 'object_creation_expression'):
+                resolved = self._resolve_call_node(node, code_bytes, caller_file,
+                                                   caller_class, caller_namespace)
                 if resolved:
                     calls.add(resolved)
             stack.extend(reversed(node.children))
@@ -181,18 +194,23 @@ class CallGraphBuilder:
         return calls
 
     def _resolve_call_node(self, node, source: bytes, caller_file: str,
-                           caller_class: Optional[str]) -> Optional[str]:
+                           caller_class: Optional[str],
+                           caller_namespace: Optional[str] = None) -> Optional[str]:
         """Resolve a tree-sitter call node to a function ID."""
         if node.type == 'function_call_expression':
-            return self._resolve_function_call(node, source, caller_file, caller_class)
+            return self._resolve_function_call(node, source, caller_file, caller_class,
+                                               caller_namespace)
         elif node.type == 'member_call_expression':
             return self._resolve_member_call(node, source, caller_file, caller_class)
         elif node.type == 'scoped_call_expression':
             return self._resolve_scoped_call(node, source, caller_file, caller_class)
+        elif node.type == 'object_creation_expression':
+            return self._resolve_new(node, source, caller_file, caller_class)
         return None
 
     def _resolve_function_call(self, node, source: bytes, caller_file: str,
-                                caller_class: Optional[str]) -> Optional[str]:
+                                caller_class: Optional[str],
+                                caller_namespace: Optional[str] = None) -> Optional[str]:
         """Resolve a simple function call like func()."""
         func_name = None
 
@@ -211,9 +229,68 @@ class CallGraphBuilder:
             return None
 
         if self._is_builtin(func_name):
+            # Higher-order builtins (call_user_func, array_map, ...) drop the OUTER call, but the
+            # callback they dispatch to is a real edge -- resolve it instead of returning None.
+            cb_idx = CALLBACK_BUILTINS.get(func_name.lower())
+            if cb_idx is not None:
+                return self._resolve_callback_arg(node, source, caller_file, caller_class, cb_idx)
             return None
 
-        return self._resolve_simple_call(func_name, caller_file, caller_class)
+        return self._resolve_simple_call(func_name, caller_file, caller_class, caller_namespace)
+
+    def _resolve_callback_arg(self, node, source: bytes, caller_file: str,
+                              caller_class: Optional[str], idx: int) -> Optional[str]:
+        """Resolve the callback argument at position `idx` of a higher-order builtin call.
+
+        Only string-literal callbacks have a static target: 'fn', 'Class::method', or the array form
+        ['Class', 'method']. Variable/closure callbacks ($cb, fn() => ...) have no resolvable target.
+        """
+        args_node = next((c for c in node.children if c.type == 'arguments'), None)
+        if args_node is None:
+            return None
+        arg_nodes = [c for c in args_node.children if c.type == 'argument']
+        if idx >= len(arg_nodes) or not arg_nodes[idx].children:
+            return None
+        value = arg_nodes[idx].children[0]
+        if value.type == 'string':
+            name = source[value.start_byte:value.end_byte].decode('utf-8', errors='replace').strip('\'"')
+            return self._resolve_callback_name(name, caller_file, caller_class)
+        if value.type == 'array_creation_expression':
+            # ['ClassName', 'method'] static callback (instance [$obj,'m'] needs a type we don't track).
+            strings = []
+            stack = [value]
+            while stack:
+                n = stack.pop()
+                if n.type == 'string':
+                    strings.append(source[n.start_byte:n.end_byte].decode('utf-8', errors='replace').strip('\'"'))
+                stack.extend(reversed(n.children))
+            if len(strings) >= 2:
+                return self._resolve_class_call(strings[0], strings[1], caller_file)
+        return None
+
+    def _resolve_callback_name(self, name: str, caller_file: str,
+                               caller_class: Optional[str]) -> Optional[str]:
+        """Resolve a string callback: 'Class::method' (static) or a plain function name."""
+        if '::' in name:
+            cls, _, method = name.partition('::')
+            return self._resolve_class_call(cls, method, caller_file)
+        if self._is_builtin(name):
+            return None
+        return self._resolve_simple_call(name, caller_file, caller_class)
+
+    def _resolve_new(self, node, source: bytes, caller_file: str,
+                     caller_class: Optional[str]) -> Optional[str]:
+        """Resolve `new ClassName(...)` to the class's __construct method, if one is defined."""
+        class_name = None
+        for child in node.children:
+            if child.type in ('name', 'qualified_name'):
+                class_name = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
+                if '\\' in class_name:
+                    class_name = class_name.rsplit('\\', 1)[-1]
+                break
+        if not class_name:
+            return None
+        return self._resolve_class_call(class_name, '__construct', caller_file)
 
     def _resolve_member_call(self, node, source: bytes, caller_file: str,
                               caller_class: Optional[str]) -> Optional[str]:
@@ -250,6 +327,10 @@ class CallGraphBuilder:
         for child in node.children:
             if child.type == 'name' and scope is not None:
                 method_name = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
+            elif child.type == 'relative_scope' and scope is None:
+                # self / static / parent are `relative_scope` nodes, not `name` -- without this branch
+                # the scope was never captured and self::/static::/parent:: calls were silently dropped.
+                scope = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
             elif child.type in ('name', 'qualified_name') and scope is None:
                 scope = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
                 if '\\' in scope:
@@ -264,15 +345,34 @@ class CallGraphBuilder:
             return None
 
         # self::method() or static::method() - same class
-        if scope in ('self', 'static', 'parent') and caller_class:
+        if scope in ('self', 'static') and caller_class:
             return self._resolve_self_call(method_name, caller_file, caller_class)
+
+        # parent::method() - resolve in the superclass (extends), not the caller's own class.
+        if scope == 'parent' and caller_class:
+            superclass = self._superclass_of(caller_file, caller_class)
+            if not superclass:
+                return None
+            if '\\' in superclass:
+                superclass = superclass.rsplit('\\', 1)[-1]  # `extends App\Base` -> match `Base`
+            # Resolve in the superclass only; do NOT fall back to the caller's own class, which would
+            # mis-link an overriding child's parent:: call to the child's own method.
+            return self._resolve_class_call(superclass, method_name, caller_file)
 
         # ClassName::method()
         return self._resolve_class_call(scope, method_name, caller_file)
 
+    def _superclass_of(self, caller_file: str, caller_class: str) -> Optional[str]:
+        """Return the superclass (extends) name of caller_class defined in caller_file, or None."""
+        for class_data in self.classes.values():
+            if class_data.get('name') == caller_class and class_data.get('file_path') == caller_file:
+                return class_data.get('superclass')
+        return None
+
     def _resolve_simple_call(self, func_name: str, caller_file: str,
-                             caller_class: Optional[str]) -> Optional[str]:
-        """Resolve a simple function call to a function ID."""
+                             caller_class: Optional[str],
+                             caller_namespace: Optional[str] = None) -> Optional[str]:
+        """Resolve a simple (unqualified) function call to a function ID."""
         # 1. Check same class first (implicit $this)
         if caller_class:
             result = self._resolve_self_call(func_name, caller_file, caller_class)
@@ -290,22 +390,42 @@ class CallGraphBuilder:
         file_imports = self.imports.get(caller_file, {})
         for import_name, import_type in file_imports.items():
             if import_type in ('require', 'require_once', 'include', 'include_once', 'use'):
-                # Try matching import path to file
+                # Match the import by file name (anchored), not an unanchored `in` substring which
+                # over-matched any path merely containing the import string.
+                imp_base = import_name.replace('\\', '/').rsplit('/', 1)[-1]
                 for file_path in self.functions_by_file:
-                    if file_path.endswith(f"{import_name}.php") or import_name in file_path:
+                    if (file_path.endswith(f"{import_name}.php")
+                            or file_path.endswith(f"/{imp_base}.php")
+                            or file_path == f"{imp_base}.php"):
                         file_funcs = self.functions_by_file[file_path]
                         for func_id in file_funcs:
                             func_data = self.functions.get(func_id, {})
                             if func_data.get('name') == func_name:
                                 return func_id
 
-        # 4. Unique name match across files
+        # 4. Unique name match across files. An unqualified call resolves within
+        #    the caller's own namespace; a function in a different namespace is not
+        #    reachable this way, so a same-named function elsewhere must not leak an
+        #    edge across the namespace boundary.
         candidates = self.functions_by_name.get(func_name, [])
-        candidates = [c for c in candidates if not self.functions.get(c, {}).get('class_name')]
+        candidates = [c for c in candidates
+                      if not self.functions.get(c, {}).get('class_name')
+                      and self._namespace_compatible(
+                          self.functions.get(c, {}).get('namespace_name'), caller_namespace)]
         if len(candidates) == 1:
             return candidates[0]
 
         return None
+
+    @staticmethod
+    def _namespace_compatible(candidate_ns: Optional[str],
+                              caller_ns: Optional[str]) -> bool:
+        """Whether an unqualified call from caller_ns may bind a function in
+        candidate_ns. They must be the same namespace (treating None / '' / '\\'
+        as the global namespace)."""
+        def norm(ns):
+            return (ns or '').strip('\\')
+        return norm(candidate_ns) == norm(caller_ns)
 
     def _resolve_self_call(self, method_name: str, caller_file: str,
                            caller_class: str) -> Optional[str]:

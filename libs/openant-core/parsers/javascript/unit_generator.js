@@ -49,6 +49,11 @@ const fs = require('fs');
 const path = require('path');
 const { DependencyResolver } = require('./dependency_resolver');
 
+// File boundary marker for enhanced code (module-level for parity with the
+// python/php/c/ruby parsers, so external consumers can import the canonical
+// marker instead of re-defining it and risking silent drift).
+const FILE_BOUNDARY = '\n\n// ========== File Boundary ==========\n\n';
+
 class UnitGenerator {
     constructor(repoPath, datasetName = null, options = {}) {
         this.repoPath = repoPath;
@@ -162,7 +167,6 @@ class UnitGenerator {
      * Matches DVNA enhanced dataset format expected by experiment.py
      */
     _assembleEnhancedCode(funcData, upstreamDependencies, downstreamCallers) {
-        const FILE_BOUNDARY = '\n\n// ========== File Boundary ==========\n\n';
         const parts = [];
         const includedCode = new Set();
 
@@ -196,9 +200,11 @@ class UnitGenerator {
         const files = new Set();
         files.add(primaryFilePath);
 
+        // Separator is the FIRST colon (matches the dependency_resolver
+        // contract); functionName may itself contain colons.
         for (const dep of upstreamDependencies) {
             if (dep.id) {
-                const colonIndex = dep.id.lastIndexOf(':');
+                const colonIndex = dep.id.indexOf(':');
                 if (colonIndex > 0) {
                     files.add(dep.id.substring(0, colonIndex));
                 }
@@ -207,7 +213,7 @@ class UnitGenerator {
 
         for (const caller of downstreamCallers) {
             if (caller.id) {
-                const colonIndex = caller.id.lastIndexOf(':');
+                const colonIndex = caller.id.indexOf(':');
                 if (colonIndex > 0) {
                     files.add(caller.id.substring(0, colonIndex));
                 }
@@ -221,8 +227,12 @@ class UnitGenerator {
      * Create a single analysis unit
      */
     _createUnit(functionId, funcData, routeHandlerMap) {
-        // Parse function ID: "relative/path/file.ts:functionName"
-        const colonIndex = functionId.lastIndexOf(':');
+        // Parse function ID: "relative/path/file.ts:functionName".
+        // The separator is the FIRST colon: the functionName may itself contain
+        // colons (e.g. an Express route id "src/r.ts:express(GET:/items/:id)").
+        // This matches the dependency_resolver contract (`funcId.split(':')[0]`)
+        // and recovers filePath/functionName correctly for multi-colon ids.
+        const colonIndex = functionId.indexOf(':');
         const filePath = functionId.substring(0, colonIndex);
         const functionName = functionId.substring(colonIndex + 1);
 
@@ -482,4 +492,4 @@ if (require.main === module) {
     }
 }
 
-module.exports = { UnitGenerator };
+module.exports = { UnitGenerator, FILE_BOUNDARY };
