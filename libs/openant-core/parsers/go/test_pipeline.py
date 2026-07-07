@@ -52,6 +52,48 @@ if str(_core_root) not in sys.path:
 from utilities.file_io import open_utf8, read_json, run_utf8, write_json
 
 
+def normalize_go_function_records(raw_functions: dict) -> dict:
+    """Normalize Go FunctionInfo records to the snake_case consumer contract.
+
+    The Go parser is a separate Go binary whose FunctionInfo records
+    (parsers/go/go_parser/types.go) use camelCase json keys
+    (``unitType``/``startLine``/``endLine``/``isExported``/``filePath``/
+    ``className``), while every other parser emits snake_case. The Python
+    reachability/entry-point consumers (EntryPointDetector, etc.) read
+    snake_case — e.g. ``func_data.get('unit_type')``. Without normalization the
+    Go records' snake keys are ``None`` and any unit_type-based logic is
+    silently broken for Go (BUG-NEW 5).
+
+    This maps the known FunctionInfo fields to snake_case, reading from either
+    shape so it is idempotent: already-snake records pass through unchanged.
+    Scope is the call_graph.json ``functions`` map only — the separate
+    analyzer_output.json camelCase contract is intentionally NOT touched.
+    """
+    normalized: dict = {}
+    for func_id, fd in raw_functions.items():
+        normalized[func_id] = {
+            'name': fd.get('name', ''),
+            'unit_type': fd.get('unit_type', fd.get('unitType', 'function')),
+            'code': fd.get('code', ''),
+            'file_path': fd.get('file_path', fd.get('filePath', '')),
+            'start_line': fd.get('start_line', fd.get('startLine', 0)),
+            'end_line': fd.get('end_line', fd.get('endLine', 0)),
+            'package': fd.get('package', ''),
+            'receiver': fd.get('receiver', ''),
+            'is_exported': fd.get('is_exported', fd.get('isExported', False)),
+            'class_name': fd.get('class_name', fd.get('className', '')),
+            'decorators': fd.get('decorators', []),
+            # Schema-completeness (BUG-5 re-verify): carry the remaining
+            # FunctionInfo fields so a Go func record matches the snake_case
+            # shape the other parsers emit. No live consumer reads these today,
+            # but leaving them None is a latent drift for future consumers.
+            'parameters': fd.get('parameters', []),
+            'returns': fd.get('returns', []),
+            'is_async': fd.get('is_async', fd.get('isAsync', False)),
+        }
+    return normalized
+
+
 def _stdout_supports_unicode() -> bool:
     """Return True if sys.stdout can emit the symbols we use for status.
 
@@ -79,7 +121,7 @@ SYM_ARROW = "→" if _UNICODE_OK else "->"
 # Add parent directory to path for utilities import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from utilities.context_enhancer import ContextEnhancer
-from utilities.agentic_enhancer import EntryPointDetector, ReachabilityAnalyzer
+from utilities.agentic_enhancer import EntryPointDetector, ReachabilityAnalyzer, blackout_warning, library_seed_ids
 
 
 class ProcessingLevel(Enum):
@@ -110,7 +152,8 @@ class GoPipelineTest:
         processing_level: ProcessingLevel = ProcessingLevel.ALL,
         skip_tests: bool = False,
         depth: int = 3,
-        name: str = None
+        name: str = None,
+        library_mode: bool = False
     ):
         self.repo_path = os.path.abspath(repo_path)
         self.output_dir = output_dir or os.path.join(os.path.dirname(__file__), 'test_output')
@@ -121,6 +164,7 @@ class GoPipelineTest:
         self.skip_tests = skip_tests
         self.depth = depth
         self.dataset_name = name
+        self.library_mode = library_mode
 
         # Go parser binary location
         self.go_parser = os.path.join(self.parser_dir, 'go_parser', 'go_parser')
@@ -305,21 +349,10 @@ class GoPipelineTest:
                 dataset_for_cg = read_json(self.dataset_file)
 
                 raw_functions = analyzer.get("functions", {})
-                # Normalise to the camelCase shape EntryPointDetector expects.
-                normalized_functions = {
-                    func_id: {
-                        'name': fd.get('name', ''),
-                        'unitType': fd.get('unit_type', fd.get('unitType', 'function')),
-                        'code': fd.get('code', ''),
-                        'filePath': fd.get('file_path', fd.get('filePath', '')),
-                        'startLine': fd.get('start_line', fd.get('startLine', 0)),
-                        'endLine': fd.get('end_line', fd.get('endLine', 0)),
-                        'package': fd.get('package', ''),
-                        'receiver': fd.get('receiver', ''),
-                        'isExported': fd.get('is_exported', fd.get('isExported', False)),
-                    }
-                    for func_id, fd in raw_functions.items()
-                }
+                # Normalise to the snake_case shape the Python consumers read
+                # (EntryPointDetector reads func_data.get('unit_type'), etc.).
+                # Idempotent: already-snake records pass through unchanged.
+                normalized_functions = normalize_go_function_records(raw_functions)
 
                 call_graph: dict = {}
                 reverse_call_graph: dict = {}
@@ -375,21 +408,11 @@ class GoPipelineTest:
 
             functions = analyzer.get("functions", {})
 
-            # Convert to expected format for EntryPointDetector
-            # Go parser uses snake_case, EntryPointDetector expects camelCase
-            normalized_functions = {}
-            for func_id, func_data in functions.items():
-                normalized_functions[func_id] = {
-                    'name': func_data.get('name', ''),
-                    'unitType': func_data.get('unit_type', func_data.get('unitType', 'function')),
-                    'code': func_data.get('code', ''),
-                    'filePath': func_data.get('file_path', func_data.get('filePath', '')),
-                    'startLine': func_data.get('start_line', func_data.get('startLine', 0)),
-                    'endLine': func_data.get('end_line', func_data.get('endLine', 0)),
-                    'package': func_data.get('package', ''),
-                    'receiver': func_data.get('receiver', ''),
-                    'isExported': func_data.get('is_exported', func_data.get('isExported', False)),
-                }
+            # Convert to the snake_case shape the Python consumers read.
+            # The Go binary's analyzer_output uses camelCase FunctionInfo keys;
+            # EntryPointDetector / ReachabilityAnalyzer read snake_case
+            # (func_data.get('unit_type'), etc.). Idempotent normalization.
+            normalized_functions = normalize_go_function_records(functions)
 
             # Load call graph from dataset (go_parser puts it in statistics)
             dataset = read_json(self.dataset_file)
@@ -411,6 +434,11 @@ class GoPipelineTest:
             # Detect entry points
             detector = EntryPointDetector(normalized_functions, call_graph)
             self.entry_points = detector.detect_entry_points()
+
+            # Library-mode: seed the exported public API (a library has no
+            # main/route/CLI marker). Union-only — never drops a real entry point.
+            if self.library_mode:
+                self.entry_points = self.entry_points | library_seed_ids(normalized_functions)
 
             # Build reachability analyzer
             reachability = ReachabilityAnalyzer(
@@ -444,6 +472,13 @@ class GoPipelineTest:
                 "filtered_out": original_count - len(filtered_units),
                 "reduction_percentage": round((1 - len(filtered_units) / original_count) * 100, 1) if original_count > 0 else 0
             }
+
+            _blackout = blackout_warning(detector.entry_point_details, original_count,
+                                         len(filtered_units),
+                                         library_mode=getattr(self, "library_mode", False))
+            if _blackout:
+                dataset["metadata"]["reachability_filter"]["warning"] = _blackout
+                print(f"  [Warning] {_blackout}", file=sys.stderr)
 
             # Write filtered dataset
             write_json(self.dataset_file, dataset)
@@ -1183,6 +1218,11 @@ Examples:
         default=None,
         help='Dataset name (default: derived from repo path)'
     )
+    parser.add_argument(
+        '--library-mode',
+        action='store_true',
+        help='Seed the exported public API as entry points (for libraries with no main/route/CLI)'
+    )
 
     args = parser.parse_args()
 
@@ -1205,7 +1245,8 @@ Examples:
         processing_level=processing_level,
         skip_tests=args.skip_tests,
         depth=args.depth,
-        name=args.name
+        name=args.name,
+        library_mode=args.library_mode
     )
     results = pipeline.run_full_pipeline()
 

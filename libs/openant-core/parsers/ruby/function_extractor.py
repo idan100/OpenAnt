@@ -138,11 +138,14 @@ class FunctionExtractor:
         """
         path_lower = file_path.lower()
 
-        if func_name == 'initialize':
-            return 'constructor'
-
+        # is_singleton must be checked BEFORE the initialize/constructor branch:
+        # `def self.initialize` is a class-level singleton method, not the
+        # instance constructor (Ruby's constructor is the instance `initialize`).
         if is_singleton:
             return 'singleton_method'
+
+        if func_name == 'initialize':
+            return 'constructor'
 
         # Non-public methods inside a class are helpers/callbacks, never
         # route handlers or callbacks-by-name, regardless of the enclosing
@@ -281,6 +284,16 @@ class FunctionExtractor:
 
         return imports
 
+    def _body_node(self, node):
+        """Return a node's body (`body` field, else a `body_statement` child)."""
+        body_node = node.child_by_field_name('body')
+        if body_node is None:
+            for child in node.children:
+                if child.type == 'body_statement':
+                    body_node = child
+                    break
+        return body_node
+
     def _extract_functions_from_tree(self, tree, source: bytes, file_path: Path,
                                      relative_path: str) -> None:
         """Extract all method definitions from a parsed tree.
@@ -303,12 +316,27 @@ class FunctionExtractor:
                     node, source, relative_path, class_name, module_name,
                     is_singleton=False, visibility=vis_state[0],
                 )
+                # A nested `def` lives in the method's body -- keep traversing so
+                # methods defined inside another method are not lost. Nested defs
+                # inherit the enclosing class but default to public visibility.
+                body_node = self._body_node(node)
+                if body_node:
+                    nested_vis = ['public']
+                    for child in reversed(body_node.children):
+                        stack.append((child, class_name, module_name, nested_vis))
+                continue
 
             elif node.type == 'singleton_method':
                 self._process_method_node(
                     node, source, relative_path, class_name, module_name,
                     is_singleton=True, visibility=vis_state[0],
                 )
+                body_node = self._body_node(node)
+                if body_node:
+                    nested_vis = ['public']
+                    for child in reversed(body_node.children):
+                        stack.append((child, class_name, module_name, nested_vis))
+                continue
 
             elif node.type == 'alias':
                 # `alias new old` keyword form.
@@ -364,7 +392,13 @@ class FunctionExtractor:
             elif node.type == 'class':
                 # Extract class name
                 name_node = node.child_by_field_name('name')
-                new_class_name = self._node_text(name_node, source) if name_node else None
+                local_class_name = self._node_text(name_node, source) if name_node else None
+                # Compose with the enclosing class so a nested class keeps its
+                # outer qualifier, e.g. `Outer::Inner`.
+                if local_class_name and class_name:
+                    new_class_name = f"{class_name}::{local_class_name}"
+                else:
+                    new_class_name = local_class_name
 
                 # Extract superclass
                 superclass = None
@@ -512,7 +546,7 @@ class FunctionExtractor:
             qualified_name = name
 
         func_id = f"{relative_path}:{qualified_name}"
-        self.functions[func_id] = {
+        self._store_function(func_id, {
             'name': name,
             'qualified_name': qualified_name,
             'file_path': relative_path,
@@ -525,13 +559,40 @@ class FunctionExtractor:
             'is_singleton': False,
             'visibility': visibility,
             'unit_type': unit_type,
-        }
+        })
         self.stats['total_functions'] += 1
         if class_name:
             self.stats['total_methods'] += 1
         else:
             self.stats['standalone_functions'] += 1
         self.stats['by_type'][unit_type] = self.stats['by_type'].get(unit_type, 0) + 1
+
+
+    def _store_function(self, func_id: str, func_data: dict) -> str:
+        """Insert a function unit, keeping BOTH on a same-(file,name) collision.
+
+        Ruby `def` executes when reached, so same-name defs in mutually-exclusive
+        conditional branches (`if/else`) are both runtime-reachable depending on
+        the condition, and the EARLIER branch may be the live one. A plain
+        keep-last store let the later (possibly dead) branch overwrite the
+        earlier (possibly live) one — a silent false negative, confirmed against
+        the real `ruby` interpreter. Keep BOTH via a deterministic `#L<line>`
+        suffix (earlier-in-source keeps the clean id), mirroring the Python
+        extractor's `_store_function`. Unconditional reopening is last-wins at
+        runtime; keeping both there is the same benign tradeoff Python accepts.
+        Collision-only: a unique name keeps its byte-identical `path:name` id.
+        """
+        if func_id not in self.functions:
+            self.functions[func_id] = func_data
+            return func_id
+        line = func_data.get('start_line', 0)
+        unique_id = f"{func_id}#L{line}"
+        n = 2
+        while unique_id in self.functions:
+            unique_id = f"{func_id}#L{line}.{n}"
+            n += 1
+        self.functions[unique_id] = func_data
+        return unique_id
 
     def _process_method_node(self, node, source: bytes, relative_path: str,
                               class_name: Optional[str], module_name: Optional[str],
@@ -575,7 +636,7 @@ class FunctionExtractor:
             'unit_type': unit_type,
         }
 
-        self.functions[func_id] = func_data
+        self._store_function(func_id, func_data)
         self.stats['total_functions'] += 1
 
         if class_name:

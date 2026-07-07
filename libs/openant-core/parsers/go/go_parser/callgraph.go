@@ -200,6 +200,13 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 	// import table instead of a name-shape heuristic.
 	imports := c.importsByFile[funcInfo.FilePath]
 
+	// Track simple func-value aliases (f := helper) so a later call f()
+	// resolves to the aliased function. Only single, unconditional bindings
+	// of the form `name := <ident>` / `name = <ident>` are tracked; any
+	// reassignment (or a non-ident RHS) marks the name ambiguous so we emit
+	// no false edge — precision over recall.
+	aliases := c.collectFuncValueAliases(file)
+
 	// Walk the AST looking for call expressions
 	ast.Inspect(file, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -208,6 +215,13 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 		}
 
 		callInfo := c.analyzeCallExpr(call, imports)
+		// Rewrite an unambiguous func-value alias call (f()) to its target
+		// (helper()) so it resolves like a direct call.
+		if callInfo.Name != "" && callInfo.Receiver == "" && callInfo.Package == "" {
+			if target, ok := aliases[callInfo.Name]; ok {
+				callInfo.Name = target
+			}
+		}
 		if callInfo.Name != "" && !c.builtins[callInfo.Name] && !c.builtins[callInfo.Package] {
 			calls = append(calls, callInfo)
 		}
@@ -217,20 +231,88 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 	return calls
 }
 
+// collectFuncValueAliases scans a parsed function body for single, unconditional
+// func-value bindings (`f := helper`) and returns name -> target-function-name.
+// A name bound more than once, or bound to anything other than a bare identifier,
+// is dropped (left out of the map) so a reassigned/conditional alias never
+// produces a false edge.
+func (c *CallGraphBuilder) collectFuncValueAliases(file *ast.File) map[string]string {
+	aliases := make(map[string]string)
+	ambiguous := make(map[string]bool)
+
+	record := func(lhs, rhs ast.Expr) {
+		lid, ok := lhs.(*ast.Ident)
+		if !ok {
+			return
+		}
+		if ambiguous[lid.Name] {
+			return
+		}
+		rid, ok := rhs.(*ast.Ident)
+		if !ok {
+			// Bound to a non-ident (call, selector, literal, ...) -> ambiguous.
+			delete(aliases, lid.Name)
+			ambiguous[lid.Name] = true
+			return
+		}
+		if _, seen := aliases[lid.Name]; seen {
+			// Second binding of the same name -> ambiguous, drop it.
+			delete(aliases, lid.Name)
+			ambiguous[lid.Name] = true
+			return
+		}
+		aliases[lid.Name] = rid.Name
+	}
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		// Only handle 1:1 bindings (f := helper); skip tuple assignments.
+		if len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+			// Mark any ident LHS ambiguous so a multi-value rebind can't alias.
+			for _, lhs := range assign.Lhs {
+				if lid, ok := lhs.(*ast.Ident); ok {
+					delete(aliases, lid.Name)
+					ambiguous[lid.Name] = true
+				}
+			}
+			return true
+		}
+		record(assign.Lhs[0], assign.Rhs[0])
+		return true
+	})
+
+	return aliases
+}
+
 func (c *CallGraphBuilder) analyzeCallExpr(call *ast.CallExpr, imports map[string]string) CallInfo {
 	info := CallInfo{}
 
-	switch fun := call.Fun.(type) {
+	// Unwrap a generic instantiation so fn[T](), fn[K,V](), obj.M[T]() and obj.M[K,V]() are
+	// analyzed identically to their non-generic forms. A single type argument parses as
+	// *ast.IndexExpr, multiple as *ast.IndexListExpr; both wrap the underlying function
+	// expression (an Ident or a SelectorExpr) in .X.
+	fun := call.Fun
+	switch idx := fun.(type) {
+	case *ast.IndexExpr:
+		fun = idx.X
+	case *ast.IndexListExpr:
+		fun = idx.X
+	}
+
+	switch f := fun.(type) {
 	case *ast.Ident:
-		// Simple call: funcName()
-		info.Name = fun.Name
+		// Simple call: funcName() (or generic Gen[..]())
+		info.Name = f.Name
 
 	case *ast.SelectorExpr:
-		// Method or package call: obj.Method() or pkg.Func()
-		info.Name = fun.Sel.Name
+		// Method or package call: obj.Method() or pkg.Func() (or generic obj.M[..]())
+		info.Name = f.Sel.Name
 		info.IsMethod = true
 
-		switch x := fun.X.(type) {
+		switch x := f.X.(type) {
 		case *ast.Ident:
 			info.Receiver = x.Name
 			// It is a package call iff the receiver name is an import alias of this file.
@@ -247,12 +329,6 @@ func (c *CallGraphBuilder) analyzeCallExpr(call *ast.CallExpr, imports map[strin
 		case *ast.CallExpr:
 			// Result of another call: getObj().Method()
 			info.Receiver = "~call_result~"
-		}
-
-	case *ast.IndexExpr:
-		// Generic function call: fn[T]()
-		if ident, ok := fun.X.(*ast.Ident); ok {
-			info.Name = ident.Name
 		}
 	}
 

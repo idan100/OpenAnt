@@ -138,6 +138,23 @@ class FunctionExtractor:
                 return True
         return False
 
+    def _extract_trait_names(self, use_node, source: bytes) -> List[str]:
+        """Extract trait names from an in-class `use_declaration` node.
+
+        Handles grouped uses (`use A, B\\C;`). Each trait is a `name` or
+        `qualified_name` child; namespace-qualified names are reduced to their
+        last segment so resolution matches the trait's unqualified class name.
+        """
+        names = []
+        for child in use_node.children:
+            if child.type in ('name', 'qualified_name'):
+                trait = self._node_text(child, source)
+                if '\\' in trait:
+                    trait = trait.rsplit('\\', 1)[-1]
+                if trait:
+                    names.append(trait)
+        return names
+
     def _get_visibility(self, node, source: bytes) -> Optional[str]:
         """Extract visibility modifier from a method_declaration node."""
         for child in node.children:
@@ -306,6 +323,7 @@ class FunctionExtractor:
                 if new_class_name:
                     class_id = f"{relative_path}:{new_class_name}"
                     methods = []
+                    traits = []
                     # Find declaration_list (class body)
                     body_node = node.child_by_field_name('body')
                     if body_node is None:
@@ -323,6 +341,13 @@ class FunctionExtractor:
                                         methods.append(f"static:{mname}")
                                     else:
                                         methods.append(mname)
+                            elif child.type == 'use_declaration':
+                                # In-class `use TraitA, NS\TraitB;` composes traits into the class.
+                                # tree-sitter-php emits this as `use_declaration` (distinct from the
+                                # top-level `namespace_use_declaration`), with each trait as a
+                                # `name`/`qualified_name` child. Record the unqualified trait name so
+                                # the call-graph builder can resolve $this->/self:: into the trait.
+                                traits.extend(self._extract_trait_names(child, source))
 
                     self.classes[class_id] = {
                         'name': new_class_name,
@@ -330,6 +355,7 @@ class FunctionExtractor:
                         'start_line': node.start_point[0] + 1,
                         'end_line': node.end_point[0] + 1,
                         'methods': methods,
+                        'traits': traits,
                         'superclass': superclass,
                         'interfaces': interfaces,
                         'namespace_name': namespace_name,
@@ -420,6 +446,50 @@ class FunctionExtractor:
                         stack.append((child, new_trait_name, namespace_name))
                 continue
 
+            elif node.type == 'enum_declaration':
+                # PHP 8.1+ enums are class-like callable containers; register
+                # the enum as a class so its methods get qualified ids
+                # (Enum.method) and class context, mirroring trait/interface.
+                name_node = node.child_by_field_name('name')
+                new_enum_name = self._node_text(name_node, source) if name_node else None
+
+                if new_enum_name:
+                    class_id = f"{relative_path}:{new_enum_name}"
+                    methods = []
+                    body_node = node.child_by_field_name('body')
+                    if body_node is None:
+                        for child in node.children:
+                            if child.type == 'enum_declaration_list':
+                                body_node = child
+                                break
+
+                    if body_node:
+                        for child in body_node.children:
+                            if child.type == 'method_declaration':
+                                mname = self._get_function_name(child, source)
+                                if mname:
+                                    if self._is_static_method(child, source):
+                                        methods.append(f"static:{mname}")
+                                    else:
+                                        methods.append(mname)
+
+                    self.classes[class_id] = {
+                        'name': new_enum_name,
+                        'file_path': relative_path,
+                        'start_line': node.start_point[0] + 1,
+                        'end_line': node.end_point[0] + 1,
+                        'methods': methods,
+                        'superclass': None,
+                        'interfaces': [],
+                        'namespace_name': namespace_name,
+                    }
+                    self.stats['total_classes'] += 1
+
+                if body_node:
+                    for child in reversed(body_node.children):
+                        stack.append((child, new_enum_name, namespace_name))
+                continue
+
             elif node.type == 'namespace_definition':
                 # Extract namespace name
                 name_node = node.child_by_field_name('name')
@@ -428,18 +498,84 @@ class FunctionExtractor:
                 # Recurse into namespace body
                 body_node = node.child_by_field_name('body')
                 if body_node is None:
-                    # Namespace without braces covers rest of file; recurse children directly
-                    for child in reversed(node.children):
-                        if child.type not in ('namespace', 'name', ';'):
-                            stack.append((child, class_name, new_namespace_name))
+                    # Braceless 'namespace App\Svc;': the declarations it covers
+                    # are SIBLINGS of this node, not children -- they are pushed
+                    # by the container's traversal (see _push_children, which
+                    # carries the braceless namespace forward to siblings). The
+                    # node's own children (namespace/name/;) have nothing to
+                    # extract, so there is nothing to recurse here.
+                    pass
                 else:
                     for child in reversed(body_node.children):
                         stack.append((child, class_name, new_namespace_name))
                 continue  # Don't walk children again
 
+            elif node.type == 'anonymous_class':
+                # `new class { ... }` (PHP 7+) has no source name. Without a synthetic
+                # identity its methods fall through the catch-all else with the OUTER
+                # class_name (None at top level), so they're keyed as bare functions and
+                # two distinct anonymous classes that both define e.g. handle() collide on
+                # one id (the later silently overwrites the earlier). Synthesize a stable,
+                # location-based name so each anonymous class is distinct and its methods
+                # are qualified (class@anonymous:<line>:<col>.method). Line AND column are
+                # both needed: two `new class {}` on one physical line share a start line,
+                # so column is what keeps them distinct (else they'd still collide).
+                anon_name = (
+                    f"class@anonymous:{node.start_point[0] + 1}:{node.start_point[1]}"
+                )
+                body_node = None
+                for child in node.children:
+                    if child.type == 'declaration_list':
+                        body_node = child
+                        break
+
+                if body_node:
+                    methods = []
+                    for child in body_node.children:
+                        if child.type == 'method_declaration':
+                            mname = self._get_function_name(child, source)
+                            if mname:
+                                if self._is_static_method(child, source):
+                                    methods.append(f"static:{mname}")
+                                else:
+                                    methods.append(mname)
+
+                    self.classes[f"{relative_path}:{anon_name}"] = {
+                        'name': anon_name,
+                        'file_path': relative_path,
+                        'start_line': node.start_point[0] + 1,
+                        'end_line': node.end_point[0] + 1,
+                        'methods': methods,
+                        'superclass': None,
+                        'interfaces': [],
+                        'namespace_name': namespace_name,
+                    }
+                    self.stats['total_classes'] += 1
+
+                    for child in reversed(body_node.children):
+                        stack.append((child, anon_name, namespace_name))
+                continue  # Don't walk children again
+
             else:
-                for child in reversed(node.children):
-                    stack.append((child, class_name, namespace_name))
+                self._push_children(stack, node.children, source, class_name, namespace_name)
+
+    def _push_children(self, stack, children, source: bytes,
+                       class_name: Optional[str], namespace_name: Optional[str]) -> None:
+        """Push a node's children onto the traversal stack, honoring a braceless
+        ``namespace App\\X;`` declaration: such a node has no body, and the
+        declarations it governs are its FOLLOWING SIBLINGS (until the next
+        namespace declaration). Propagate that namespace to those siblings."""
+        current_ns = namespace_name
+        ns_overrides = {}
+        for child in children:
+            if child.type == 'namespace_definition' and child.child_by_field_name('body') is None:
+                name_node = child.child_by_field_name('name')
+                if name_node is not None:
+                    current_ns = self._node_text(name_node, source)
+                continue
+            ns_overrides[id(child)] = current_ns
+        for child in reversed(children):
+            stack.append((child, class_name, ns_overrides.get(id(child), namespace_name)))
 
     def _process_function_node(self, node, source: bytes, relative_path: str,
                                 class_name: Optional[str], namespace_name: Optional[str],
@@ -450,7 +586,16 @@ class FunctionExtractor:
             return
 
         code = self._node_text(node, source)
-        start_line = node.start_point[0] + 1  # tree-sitter is 0-indexed
+        # tree-sitter is 0-indexed. The method_declaration node spans any
+        # leading PHP8 attribute_list (e.g. #[Route(...)]), so node.start_point
+        # would point at the attribute line. Anchor start_line at the actual
+        # declaration (first non-attribute child) instead.
+        decl_node = node
+        for child in node.children:
+            if child.type != 'attribute_list':
+                decl_node = child
+                break
+        start_line = decl_node.start_point[0] + 1
         end_line = node.end_point[0] + 1
         parameters = self._get_parameters(node, source)
 
@@ -482,7 +627,7 @@ class FunctionExtractor:
             'unit_type': unit_type,
         }
 
-        self.functions[func_id] = func_data
+        self._store_function(func_id, func_data)
         self.stats['total_functions'] += 1
 
         if class_name:
@@ -524,7 +669,7 @@ class FunctionExtractor:
 
         func_id = f"{relative_path}:{qualified_name}"
 
-        self.functions[func_id] = {
+        self._store_function(func_id, {
             'name': name,
             'qualified_name': qualified_name,
             'file_path': relative_path,
@@ -536,10 +681,34 @@ class FunctionExtractor:
             'parameters': parameters,
             'is_static': False,
             'unit_type': 'closure',
-        }
+        })
         self.stats['total_functions'] += 1
         self.stats['standalone_functions'] += 1
         self.stats['by_type']['closure'] = self.stats['by_type'].get('closure', 0) + 1
+
+    def _store_function(self, func_id: str, func_data: dict) -> str:
+        """Insert a function unit, keeping BOTH on a same-(file,name) collision.
+
+        PHP forbids plain redefinition (fatal), so legal duplicates arise only
+        from mutually-exclusive conditional branches — an `if/else` or a
+        defensive double `if(!function_exists('x')){...}` — where which branch
+        is live is environment-dependent and the EARLIER branch may be the one
+        that runs. Keying solely on `qualified_name` let the later branch
+        overwrite the earlier (a silent false negative). Disambiguate
+        DETERMINISTICALLY by source line (`#L<line>`); the earlier-in-source
+        unit keeps the clean id. Mirrors the Python extractor's `_store_function`.
+        """
+        if func_id not in self.functions:
+            self.functions[func_id] = func_data
+            return func_id
+        line = func_data.get('start_line', 0)
+        unique_id = f"{func_id}#L{line}"
+        n = 2
+        while unique_id in self.functions:
+            unique_id = f"{func_id}#L{line}.{n}"
+            n += 1
+        self.functions[unique_id] = func_data
+        return unique_id
 
     def _extract_module_level_unit(self, tree, source: bytes,
                                     relative_path: str) -> None:
@@ -625,7 +794,7 @@ class FunctionExtractor:
             self.stats['files_with_errors'] += 1
             return
 
-        relative_path = str(file_path.relative_to(self.repo_path))
+        relative_path = file_path.relative_to(self.repo_path).as_posix()
 
         try:
             tree = self.parser.parse(source)

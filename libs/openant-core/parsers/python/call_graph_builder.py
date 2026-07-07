@@ -186,10 +186,18 @@ class CallGraphBuilder:
         # Local variable -> constructor-type map, so that `v = ClassName(); v.method()`
         # dispatches to the bound type's method.
         local_types = self._collect_local_types(tree)
+        # Receiver names that refer to the current instance/class: self/cls plus any
+        # local name single-bound to them (obj = self; obj.method()).
+        self_aliases = {'self', 'cls'} | self._collect_self_aliases(tree)
+
+        # Local function-value aliases within this caller: `fn = helper` makes a
+        # subsequent `fn()` a call to `helper`. Resolve the alias target to a
+        # function ID up front so the call resolver can follow it.
+        aliases = self._build_alias_map(tree, caller_file)
 
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
-                resolved = self._resolve_call_node(node, caller_file, caller_class, local_types)
+                resolved = self._resolve_call_node(node, caller_file, caller_class, local_types, aliases, self_aliases)
                 if resolved:
                     calls.add(resolved)
                 # Higher-order-function callbacks: a function reference passed as an
@@ -248,15 +256,146 @@ class CallGraphBuilder:
                     callees.append(resolved)
         return callees
 
+    def _build_alias_map(self, tree: ast.AST, caller_file: str) -> Dict[str, str]:
+        """Map local names bound to a known function value -> that function's ID.
+
+        Captures simple `name = other_name` bindings where `other_name` resolves
+        (same-file or via the global single-name index) to a user function. This
+        lets `fn = helper; fn()` recover the `helper` edge. Class/method targets
+        are out of scope (only ast.Name = ast.Name single-target assigns).
+
+        SINGLE-UNCONDITIONAL-ASSIGNMENT GUARD: an alias is kept ONLY when the
+        name is bound exactly once AND at the function/module top level (a direct
+        statement of the body, not nested inside an If/For/While/Try/With or any
+        other block). A name bound 2+ times (last-write-wins) or bound inside a
+        conditional/loop/try/with is a "maybe" binding; resolving it would assert
+        a maybe as definite, so we drop it and let `x()` fall through to normal
+        resolution (no edge). Precision over recall.
+        """
+        # Count EVERY assignment to each name anywhere in the body (any nesting,
+        # both Assign targets and AnnAssign), so a reassignment or a conditional
+        # rebinding disqualifies the name even if one binding is top-level.
+        assign_counts: Dict[str, int] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    for name in self._assigned_names(target):
+                        assign_counts[name] = assign_counts.get(name, 0) + 1
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                for name in self._assigned_names(node.target):
+                    assign_counts[name] = assign_counts.get(name, 0) + 1
+
+        # Only consider candidate aliases declared at the body's TOP LEVEL.
+        top_level = self._function_body_statements(tree)
+        aliases: Dict[str, str] = {}
+        for stmt in top_level:
+            if not isinstance(stmt, ast.Assign):
+                continue
+            if not isinstance(stmt.value, ast.Name):
+                continue
+            if len(stmt.targets) != 1:
+                continue
+            target = stmt.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            if target.id == stmt.value.id:
+                continue
+            # GUARD: bound exactly once across the whole body (single +
+            # unconditional, because a conditional binding would push the
+            # top-level count higher OR not appear at top level at all).
+            if assign_counts.get(target.id, 0) != 1:
+                continue
+            resolved = self._resolve_simple_call(stmt.value.id, caller_file)
+            if resolved:
+                aliases[target.id] = resolved
+        return aliases
+
+    @staticmethod
+    def _assigned_names(target: ast.AST):
+        """Yield the simple Name ids bound by an assignment target (recursively
+        through tuple/list unpacking)."""
+        if isinstance(target, ast.Name):
+            yield target.id
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                yield from CallGraphBuilder._assigned_names(elt)
+
+    @staticmethod
+    def _function_body_statements(tree: ast.AST) -> List[ast.stmt]:
+        """Return the top-level statements of the analysed function body.
+
+        The extractor's `code` includes the `def` line, so a single function
+        parses to Module(body=[FunctionDef]); the real body is that def's body.
+        Fall back to the module body for bare module-level code.
+        """
+        body = getattr(tree, 'body', [])
+        if len(body) == 1 and isinstance(body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return list(body[0].body)
+        return list(body)
+
+    def _resolve_local_function(self, func_name: str, caller_file: str) -> Optional[str]:
+        """Resolve a bare name to a same-file, non-method user function.
+
+        Deliberately same-file ONLY (no global cross-file fallback) so a genuine
+        builtin call is never linked to an unrelated same-named function in
+        another file.
+        """
+        for func_id in self.functions_by_file.get(caller_file, []):
+            func_data = self.functions.get(func_id, {})
+            if func_data.get('name') == func_name and not func_data.get('class_name'):
+                return func_id
+        return None
+
+    def _collect_self_aliases(self, tree: ast.AST) -> Set[str]:
+        """Local names single-bound to ``self``/``cls`` (e.g. ``obj = self``).
+
+        Only single, unconditional bindings count: a name assigned more than
+        once — or ever rebound to something other than self/cls — is NOT an
+        alias, so no spurious self-method edge is created.
+        """
+        assign_count: dict = {}
+        self_bound: Set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        assign_count[tgt.id] = assign_count.get(tgt.id, 0) + 1
+                        if isinstance(node.value, ast.Name) and node.value.id in ('self', 'cls'):
+                            self_bound.add(tgt.id)
+        return {name for name in self_bound if assign_count.get(name) == 1}
+
     def _resolve_call_node(self, node: ast.Call, caller_file: str, caller_class: Optional[str],
-                           local_types: Optional[Dict[str, str]] = None) -> Optional[str]:
-        """Resolve an AST Call node to a function ID."""
+                           local_types: Optional[Dict[str, str]] = None,
+                           aliases: Optional[Dict[str, str]] = None,
+                           self_aliases: Optional[Set[str]] = None) -> Optional[str]:
+        """Resolve an AST Call node to a function ID.
+
+        ``self_aliases`` is the set of receiver names that refer to the current
+        instance/class — always includes ``self``/``cls`` plus any local name
+        single-bound to them (``obj = self; obj.method()``). Defaults to the
+        bare ``{'self', 'cls'}`` so direct callers keep working.
+        """
         func = node.func
         local_types = local_types or {}
+        if self_aliases is None:
+            self_aliases = {'self', 'cls'}
 
         # Simple function call: func_name(...)
         if isinstance(func, ast.Name):
             func_name = func.id
+            # Local function-value alias: `fn = helper; fn()` resolves to helper.
+            if aliases and func_name in aliases:
+                return aliases[func_name]
+            # A same-file user function with the same name as a stdlib
+            # module/builtin wins over the builtin filter: the call is
+            # unambiguously to the local definition. SCOPE is deliberately
+            # restricted to the caller's own file -- we do NOT use the global
+            # cross-file name index here, so a genuine builtin call (e.g.
+            # time()) is never linked to an unrelated same-named function in
+            # some other file.
+            local = self._resolve_local_function(func_name, caller_file)
+            if local:
+                return local
             if self._is_builtin(func_name):
                 return None
             return self._resolve_simple_call(func_name, caller_file)
@@ -266,14 +405,9 @@ class CallGraphBuilder:
             method_name = func.attr
             obj = func.value
 
-            # self.method(...) - same class
-            if isinstance(obj, ast.Name) and obj.id == 'self':
-                if caller_class:
-                    return self._resolve_self_call(method_name, caller_file, caller_class)
-                return None
-
-            # cls.method(...) - classmethod
-            if isinstance(obj, ast.Name) and obj.id == 'cls':
+            # self.method(...) / cls.method(...) — same class, including a local
+            # alias single-bound to self/cls (obj = self; obj.method()).
+            if isinstance(obj, ast.Name) and obj.id in self_aliases:
                 if caller_class:
                     return self._resolve_self_call(method_name, caller_file, caller_class)
                 return None
@@ -329,14 +463,34 @@ class CallGraphBuilder:
         return None
 
     def _resolve_self_call(self, method_name: str, caller_file: str, caller_class: str) -> Optional[str]:
-        """Resolve a self.method() call within a class."""
-        class_key = f"{caller_file}:{caller_class}"
-        class_methods = self.methods_by_class.get(class_key, [])
+        """Resolve a self.method() call within a class or its (same-file) bases.
 
-        for func_id in class_methods:
-            func_data = self.functions.get(func_id, {})
-            if func_data.get('name') == method_name:
-                return func_id
+        Walks the class first, then its base classes transitively (breadth-first,
+        cycle-guarded), so a method inherited from a base resolves. Base lookup
+        is restricted to classes defined in the caller's own file -- external
+        base classes aren't in our index, so they're left unresolved rather than
+        mis-linked.
+        """
+        seen: Set[str] = set()
+        queue: List[str] = [caller_class]
+        while queue:
+            class_name = queue.pop(0)
+            if class_name in seen:
+                continue
+            seen.add(class_name)
+
+            class_key = f"{caller_file}:{class_name}"
+            for func_id in self.methods_by_class.get(class_key, []):
+                func_data = self.functions.get(func_id, {})
+                if func_data.get('name') == method_name:
+                    return func_id
+
+            class_data = self.classes.get(class_key, {})
+            for base in class_data.get('bases', []):
+                # Only same-file base names are resolvable via our index.
+                base_name = base.split('.')[-1]
+                if base_name not in seen:
+                    queue.append(base_name)
 
         return None
 
@@ -474,14 +628,34 @@ class CallGraphBuilder:
             return reexported
 
         # Strategy 2: Check if import_path itself is a function
+        # The matched function's NAME must equal the called function name --
+        # matching on parts[-1] (the module path tail) alone spuriously links
+        # e.g. `import alpha; alpha.run()` to a free function named `alpha`,
+        # ignoring that `run` (not `alpha`) was actually called.
         for func_id in self.functions:
             func_data = self.functions[func_id]
-            if func_data.get('name') == parts[-1]:
-                # Check if file path matches module path
+            if func_data.get('name') == func_name:
+                # Check if file path matches module path, by dotted COMPONENTS in EITHER
+                # direction:
+                #   - imported module is a component-suffix of the file path — a repo-root
+                #     prefix on the file (e.g. `src/pkg/auth.py` for `from pkg.auth ...`); OR
+                #   - the file path is a component-suffix of the imported module — the
+                #     repo-IS-the-package self-import (e.g. `auth.py` == `myapp/auth.py`
+                #     recorded shallow via relative_to(repo_path), for `from myapp.auth ...`).
+                # Both are real layouts, so both are kept (recall). The OLD bare `endswith`
+                # ALSO matched ACROSS component boundaries — `'extra_utils'.endswith('utils')`
+                # bound `from utils import helper` to `extra_utils.py`. No module layout
+                # produces that, so those substring-crossing matches are the ONLY edges
+                # dropped. `not em` keeps the prior name-only behavior for relative/bare
+                # imports (`from . import foo`).
                 file_path = func_data.get('file_path', '')
                 module_path = file_path.replace('/', '.').replace('.py', '')
                 expected_module = '.'.join(parts[:-1])
-                if module_path.endswith(expected_module) or expected_module.endswith(module_path):
+                mp = module_path.split('.')
+                em = expected_module.split('.') if expected_module else []
+                if (not em
+                        or (len(em) <= len(mp) and mp[-len(em):] == em)
+                        or (len(mp) <= len(em) and em[-len(mp):] == mp)):
                     return func_id
 
         return None
@@ -525,6 +699,12 @@ class CallGraphBuilder:
         pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\('
         for match in re.finditer(pattern, code):
             func_name = match.group(1)
+            # Same as the AST path: a same-file user function named like a
+            # stdlib module/builtin still wins over the builtin filter.
+            local = self._resolve_local_function(func_name, caller_file)
+            if local:
+                calls.add(local)
+                continue
             if not self._is_builtin(func_name):
                 resolved = self._resolve_simple_call(func_name, caller_file)
                 if resolved:
