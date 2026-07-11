@@ -85,8 +85,31 @@ Wizard defaults reflect the project's per-phase recommendations (stronger reason
 | `anthropic` | [console.anthropic.com](https://console.anthropic.com/settings/keys) | Reference adapter. NOT included in Claude Pro / Max subscriptions — separate billing. |
 | `openai` | [platform.openai.com](https://platform.openai.com/api-keys) | NOT included in ChatGPT / Codex subscriptions — separate billing. |
 | `google` | [aistudio.google.com](https://aistudio.google.com/apikey) | NOT included in Gemini Advanced — separate billing. |
+| `claude_subscription` | No key — rides a local `claude login` session | Runs on your Claude Pro/Max subscription instead of a metered key. See below. |
 
-All three support tool calling, so any of them can drive the `enhance` and `verify` phases that use the agentic tool-use loop.
+All four support tool calling, so any of them can drive the `enhance` and `verify` phases that use the agentic tool-use loop.
+
+#### Running on a Claude Pro/Max subscription instead of an API key
+
+The `claude_subscription` provider routes completions through a locally installed, logged-in [Claude Code CLI](https://code.claude.com/docs/en/agent-sdk) rather than `api.anthropic.com` — so scans draw on your Pro/Max subscription usage instead of separate, metered API billing. Setup:
+
+```bash
+# 1. Install the Claude Code CLI and log in once (see code.claude.com/docs for current instructions)
+claude login
+
+# 2. Install the optional Python dependency this provider needs
+cd libs/openant-core && pip install -e ".[claude-subscription]"
+
+# 3. Run the wizard and pick `claude_subscription` as the provider type — no API key prompt
+openant setup llm
+```
+
+Notes:
+
+- **No API key, no `base_url`.** The wizard skips straight past those prompts for this provider type; auth comes entirely from the `claude login` session the CLI subprocess reads at call time.
+- **Usage draws on your subscription's own cap**, not a service-account budget — running a scan spends the same Pro/Max usage you'd otherwise spend chatting with Claude. It resets on your plan's normal cycle; a `rate_limit` error from this provider usually just means "come back later," not "add a key."
+- **`enhance`/`verify` (tool-calling phases) work**, but through a best-effort bridge: this provider is Claude Code under the hood, which runs its own self-driving agent loop rather than exposing a raw completion API. OpenAnt's pipeline still executes every tool call itself — see the module docstring in `libs/openant-core/utilities/llm/providers/claude_subscription.py` for exactly how that bridge works and its known limitations (`max_tokens` is advisory only; each request is a fresh, stateless CLI session).
+- Model IDs are the same Claude model strings as the `anthropic` provider (e.g. `claude-opus-4-6`).
 
 #### Quick path for Anthropic-only setups
 
@@ -215,7 +238,7 @@ openant project switch <org/repo> # switch active project
 Things on the list, in no particular order:
 
 - **More provider adapters.** Ollama (local models), vLLM, Cohere, Mistral, Groq, Amazon Bedrock, Azure OpenAI — each is a small Python adapter recipe (plus a few Go wizard/probe touch-points if you want it offered by `openant setup llm`) per the contributor guide. Lower the barrier to local / on-prem inference.
-- **Subscription-based auth.** ChatGPT / Codex, Claude Pro / Max, and Gemini Advanced subscriptions don't currently grant API quota — users have to maintain a separate API-tier key per provider. OAuth-based adapters that ride the consumer subscription would close that gap.
+- **Subscription-based auth.** Claude Pro / Max is now covered by the `claude_subscription` provider (see above). ChatGPT / Codex and Gemini Advanced subscriptions still don't grant API quota — users have to maintain a separate API-tier key for those two. OAuth-based adapters that ride those consumer subscriptions would close the remaining gap.
 - **Cross-provider tool-call quirks.** All three shipped adapters support tool calling, but the long tail (parallel tool calls, strict-mode schema enforcement, retry semantics on partial JSON) behaves differently per provider. Real-world scans surface these — PRs welcome.
 - **More languages.** The supported-languages list above is current coverage. Rust, Java, C#, and Swift come up frequently.
 - **Hosted scan service.** Knostic offers free scans for OSS projects today via the form linked above; a self-serve API for trusted partners is a future possibility.

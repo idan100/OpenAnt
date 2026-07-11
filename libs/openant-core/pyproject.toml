@@ -30,6 +30,14 @@ dev = [
     "pytest>=8.0.0",
     "ruff>=0.8.0",
 ]
+# Only needed for the "claude_subscription" provider (utilities/llm/providers/
+# claude_subscription.py), which rides a Claude Pro/Max login instead of a
+# metered API key. Also requires the Claude Code CLI installed + `claude
+# login` run once — see that module's docstring. Not a core dependency
+# because most users don't need Node.js / the Claude Code CLI at all.
+claude-subscription = [
+    "claude-agent-sdk>=0.1.0",
+]
 
 [project.scripts]
 openant = "openant.cli:main"

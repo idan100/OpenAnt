@@ -40,63 +40,70 @@ var setupLLMPhases = []phaseSpec{
 		name:  "app_context",
 		short: "Application-context classification (runs first in scan).",
 		defaultModels: map[string]string{
-			"anthropic": "claude-sonnet-4-20250514",
-			"openai":    "gpt-4o-mini",
-			"google":    "gemini-2.0-flash",
+			"anthropic":           "claude-sonnet-4-20250514",
+			"openai":              "gpt-4o-mini",
+			"google":              "gemini-2.0-flash",
+			"claude_subscription": "claude-sonnet-4-20250514",
 		},
 	},
 	{
 		name:  "llm_reach",
 		short: "LLM-driven reachability review (opt-in stage).",
 		defaultModels: map[string]string{
-			"anthropic": "claude-opus-4-6",
-			"openai":    "gpt-4o",
-			"google":    "gemini-1.5-pro",
+			"anthropic":           "claude-opus-4-6",
+			"openai":              "gpt-4o",
+			"google":              "gemini-1.5-pro",
+			"claude_subscription": "claude-opus-4-6",
 		},
 	},
 	{
 		name:  "enhance",
 		short: "Context enhancement (single-shot + agentic tool calling).",
 		defaultModels: map[string]string{
-			"anthropic": "claude-sonnet-4-20250514",
-			"openai":    "gpt-4o-mini",
-			"google":    "gemini-2.0-flash",
+			"anthropic":           "claude-sonnet-4-20250514",
+			"openai":              "gpt-4o-mini",
+			"google":              "gemini-2.0-flash",
+			"claude_subscription": "claude-sonnet-4-20250514",
 		},
 	},
 	{
 		name:  "analyze",
 		short: "Stage 1 vulnerability detection.",
 		defaultModels: map[string]string{
-			"anthropic": "claude-opus-4-6",
-			"openai":    "gpt-4o",
-			"google":    "gemini-1.5-pro",
+			"anthropic":           "claude-opus-4-6",
+			"openai":              "gpt-4o",
+			"google":              "gemini-1.5-pro",
+			"claude_subscription": "claude-opus-4-6",
 		},
 	},
 	{
 		name:  "verify",
 		short: "Stage 2 attacker simulation (tool calling).",
 		defaultModels: map[string]string{
-			"anthropic": "claude-opus-4-6",
-			"openai":    "gpt-4o",
-			"google":    "gemini-1.5-pro",
+			"anthropic":           "claude-opus-4-6",
+			"openai":              "gpt-4o",
+			"google":              "gemini-1.5-pro",
+			"claude_subscription": "claude-opus-4-6",
 		},
 	},
 	{
 		name:  "dynamic_test",
 		short: "Docker exploit-test generation.",
 		defaultModels: map[string]string{
-			"anthropic": "claude-sonnet-4-20250514",
-			"openai":    "gpt-4o-mini",
-			"google":    "gemini-2.0-flash",
+			"anthropic":           "claude-sonnet-4-20250514",
+			"openai":              "gpt-4o-mini",
+			"google":              "gemini-2.0-flash",
+			"claude_subscription": "claude-sonnet-4-20250514",
 		},
 	},
 	{
 		name:  "report",
 		short: "Disclosure + summary + remediation generation.",
 		defaultModels: map[string]string{
-			"anthropic": "claude-sonnet-4-20250514",
-			"openai":    "gpt-4o-mini",
-			"google":    "gemini-2.0-flash",
+			"anthropic":           "claude-sonnet-4-20250514",
+			"openai":              "gpt-4o-mini",
+			"google":              "gemini-2.0-flash",
+			"claude_subscription": "claude-sonnet-4-20250514",
 		},
 	},
 }
@@ -127,15 +134,32 @@ var knownModels = map[string][]string{
 		"gemini-2.0-flash",
 		"gemini-2.0-flash-lite",
 	},
+	// Same model IDs as "anthropic" — claude_subscription is the same
+	// models, just authenticated via a local `claude login` session
+	// (Claude Pro/Max) instead of an api.anthropic.com API key.
+	"claude_subscription": {
+		"claude-opus-4-6",
+		"claude-opus-4-20250514",
+		"claude-sonnet-4-20250514",
+		"claude-haiku-4-5-20251001",
+	},
 }
 
-// Provider adapter types the wizard offers in the picker. All three
-// ship with a Python adapter (anthropic, openai, google) — see
+// Provider adapter types the wizard offers in the picker. All four
+// ship with a Python adapter — see
 // “libs/openant-core/utilities/llm/providers/__init__.py“ — so a
-// completed wizard config runs without further changes. The wizard
-// probes each provider+model pair against the real provider API
-// before saving, so a typo'd key or model ID surfaces immediately.
-var supportedProviderTypes = []string{"anthropic", "openai", "google"}
+// completed wizard config runs without further changes. anthropic /
+// openai / google are probed against the real provider API before
+// saving; claude_subscription is probed by checking the local
+// `claude` CLI's login status (see probeClaudeSubscription) since
+// there's no API key to validate.
+var supportedProviderTypes = []string{"anthropic", "openai", "google", "claude_subscription"}
+
+// claudeSubscriptionTypes marks provider types that authenticate via a
+// local CLI login rather than an API key + optional base_url — used to
+// skip the credential prompts in promptNewProvider and the
+// key-from-environment probe-skip logic in probeAllPhases.
+var claudeSubscriptionTypes = map[string]bool{"claude_subscription": true}
 
 // apiKeyHints maps a provider type to a one-line reminder shown right
 // before the wizard asks for the API key. Used to head off the common
@@ -402,6 +426,16 @@ func promptNewProvider(reader *bufio.Reader, name string) (config.ProviderEntry,
 			fmt.Fprintln(os.Stderr, "To use a provider not listed here, contribute an adapter — see docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md.")
 			continue
 		}
+		// claude_subscription has no API key at all — it authenticates
+		// via a local `claude login` session (Claude Pro/Max), not a
+		// credential the wizard collects. Skip straight past the
+		// key/base_url prompts that every other provider type needs.
+		if claudeSubscriptionTypes[provType] {
+			fmt.Fprintln(os.Stderr, "No API key needed — this provider rides a local `claude login` session.")
+			fmt.Fprintln(os.Stderr, "Requires: the Claude Code CLI installed and `claude login` run once")
+			fmt.Fprintln(os.Stderr, "(authenticates with your Claude Pro/Max subscription, not a metered key).")
+			return config.ProviderEntry{Type: provType}, nil
+		}
 		// Per-provider subscription-vs-API reminder — the wizard needs
 		// an API key, not consumer-subscription credentials. ChatGPT /
 		// Claude Pro / Gemini Advanced subscriptions are separate
@@ -577,7 +611,10 @@ func probeAllPhases(
 			return fmt.Errorf("internal: provider %q referenced by phase %q but not collected", ref.Provider, phase)
 		}
 		fmt.Fprintf(os.Stderr, "  %s/%s ... ", ref.Provider, ref.Model)
-		if prov.APIKey == "" {
+		// claude_subscription has no API key to check for blankness —
+		// it's probed by checking the local `claude` CLI's login
+		// status instead, handled in the switch below.
+		if prov.APIKey == "" && !claudeSubscriptionTypes[prov.Type] {
 			// Blank key means "read from the environment" (the wizard
 			// offers this and WriteLLMConfig persists the env-read shape).
 			// The Go probe can't read the provider's env var, so skip it;
@@ -594,6 +631,8 @@ func probeAllPhases(
 			probeErr = probeOpenAI(prov.APIKey, prov.BaseURL, ref.Model)
 		case "google":
 			probeErr = probeGoogle(prov.APIKey, prov.BaseURL, ref.Model)
+		case "claude_subscription":
+			probeErr = probeClaudeSubscription()
 		default:
 			fmt.Fprintln(os.Stderr, "SKIPPED")
 			return fmt.Errorf("provider type %q has no probe implementation yet", prov.Type)
