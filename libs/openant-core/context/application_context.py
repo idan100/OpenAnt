@@ -465,10 +465,42 @@ If the repository doesn't fit any of these types (e.g., desktop app, mobile app,
 
 ## Security Model by Type
 
-- **web_app**: Remote attackers via HTTP. SSRF, XSS, SQLi, path traversal are real concerns.
+- **web_app**: Remote attackers via HTTP. SSRF, XSS, SQLi, path traversal are real concerns --
+  BUT check deployment model first (see below): the same bug can be a real
+  vulnerability in one deployment model and not exist as one at all in another.
 - **cli_tool**: Local user has shell access. Path traversal, file operations are NOT vulnerabilities.
 - **library**: No direct attack surface. Vulnerabilities depend on how the caller uses the library.
 - **agent_framework**: Code execution is the CORE FEATURE. Focus on sandbox escapes, not code execution itself.
+
+## Deployment model (web_app only -- determines who the attacker actually is)
+
+Before flagging anything that requires an admin/owner/operator role to set up (a
+webhook URL, an integration endpoint, an import source, a plugin path, etc.),
+determine which of these the repository actually is:
+
+- **Multi-tenant / hosted SaaS**: one deployment serves many mutually-untrusted
+  organizations or users (e.g. a public hosted service, a platform where
+  strangers sign up for accounts on the *vendor's* infrastructure). Here, one
+  tenant's admin configuring SSRF/internal access is a REAL vulnerability --
+  it can reach the *host's* internal network, other tenants' data, or the
+  host's own cloud metadata, none of which that tenant's admin is entitled to.
+- **Single-tenant / self-hosted**: the software is deployed by its own
+  operator, for their own use (typically installed via Docker/a setup
+  script/a "run this on your own server" install flow, one organization per
+  instance). Here, the account administrator role usually maps 1:1 to "the
+  person who deployed and controls this server." An admin-configured SSRF
+  reaching the *same* server's internal network or cloud metadata service
+  grants that admin NOTHING they don't already have via direct server/console
+  access -- it crosses no privilege boundary and is NOT a vulnerability,
+  regardless of how technically real the request is. This holds even if a
+  non-admin can *trigger* the already-configured webhook (triggering a
+  request the admin themselves set up is not privilege escalation).
+  Look for signals: README/docs describing "self-hosted", "install on your
+  own server", a Docker Compose / single-command install flow, no
+  multi-tenant billing or org-signup flow, "for your team" framing.
+- If genuinely unclear from the repo, say so in `evidence` and default to
+  treating admin-configured findings as **more** scrutiny-worthy, not less --
+  don't assume multi-tenant just because it's a web_app.
 
 ## Output Format
 
@@ -494,7 +526,8 @@ Respond with a JSON object (no other text):
   "not_a_vulnerability": [
     "Specific patterns that should NOT be flagged as vulnerabilities",
     "e.g., 'Path traversal in CLI commands - user has filesystem access'",
-    "e.g., 'Subprocess execution in agent tools - this is the core feature'"
+    "e.g., 'Subprocess execution in agent tools - this is the core feature'",
+    "e.g., (single-tenant self-hosted only) 'Admin-configured SSRF via webhook/integration URLs - the account admin is the server operator and already has direct access to the same internal network/metadata service'"
   ],
   "requires_remote_trigger": true,
   "confidence": 0.85,

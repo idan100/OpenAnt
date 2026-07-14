@@ -61,7 +61,17 @@ def run_tests(
     findings = pipeline_data.get("findings", [])
     testable = [
         f for f in findings
-        if f.get("stage2_verdict") in ("confirmed", "agreed", "vulnerable")
+        # "unverified" included: Stage 2 couldn't complete (e.g. the
+        # claude_subscription provider's agentic tool-use bridge is
+        # documented best-effort for multi-turn phases -- confirmed live,
+        # 2026-07: verify landed on "unverified" for a real, valid finding)
+        # -- that's a Stage 2 reliability gap, not a judgment that the
+        # finding is safe. Excluding it meant dynamic-test silently never
+        # ran (0 testable) and the finding was stuck at REACHABLE_ARGUMENT
+        # forever with no path to a real verdict either way. "rejected" is
+        # still excluded on purpose: that's Stage 2 actively disagreeing,
+        # a real negative signal, not a gap.
+        if f.get("stage2_verdict") in ("confirmed", "agreed", "vulnerable", "unverified")
     ]
 
     print(f"[Dynamic Test] {len(testable)} testable findings "

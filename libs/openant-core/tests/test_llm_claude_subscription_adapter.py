@@ -79,19 +79,35 @@ class _FakeThinkingBlock:
         self.signature = signature
 
 
+class _FakeAssistantMessage:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeResultMessage:
+    def __init__(self, subtype="success"):
+        self.subtype = subtype
+
+
 @pytest.fixture(autouse=True)
 def _stub_claude_agent_sdk_module(monkeypatch):
     """Make ``import claude_agent_sdk`` succeed inside the constructor
     without the real (optional) package installed, and give ``_translate``
-    / ``_has_substantive_content`` the block classes they isinstance()-check
-    against. ``_run_query``/``_build_tool_bridge`` are monkeypatched
-    per-test, so nothing else ever imports from this module.
+    / ``_has_substantive_content`` / ``_run_query`` the block/message
+    classes they isinstance()-check against. ``query`` itself is left
+    unset here — only the ``TestRunQueryExceptionSalvage`` class (which
+    exercises the real ``_run_query``, not the ``_stub_run_query``
+    replacement every other test uses) monkeypatches it in.
     """
     fake_mod = types.ModuleType("claude_agent_sdk")
     fake_mod.TextBlock = _FakeTextBlock
     fake_mod.ToolUseBlock = _FakeToolUseBlock
     fake_mod.ThinkingBlock = _FakeThinkingBlock
+    fake_mod.AssistantMessage = _FakeAssistantMessage
+    fake_mod.ResultMessage = _FakeResultMessage
+    fake_mod.ClaudeAgentOptions = lambda **kwargs: SimpleNamespace(**kwargs)
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake_mod)
+    return fake_mod
 
 
 @pytest.fixture(autouse=True)
@@ -259,6 +275,63 @@ class TestSubstantiveContentFilter:
     def test_text_is_substantive(self):
         msg = SimpleNamespace(content=[_text("hi")])
         assert mod._has_substantive_content(msg) is True
+
+
+# ---------------------------------------------------------------------------
+# Salvage a captured message when the SDK raises mid-stream (regression:
+# hit live — the real subscription rate limit fired mid-test, the SDK
+# yielded an AssistantMessage(error="rate_limit") and THEN raised a
+# confusing internal exception while finishing the generator)
+# ---------------------------------------------------------------------------
+
+
+class TestRunQueryExceptionSalvage:
+    def test_salvages_message_seen_before_a_mid_stream_exception(self, monkeypatch, _stub_claude_agent_sdk_module):
+        sdk = _stub_claude_agent_sdk_module
+        # Shape matches what was actually observed live: the rate-limited
+        # message carries explanatory text, not empty content.
+        rate_limited = _FakeAssistantMessage(content=[_FakeTextBlock("You've hit your session limit")])
+        rate_limited.error = "rate_limit"
+
+        async def fake_query(*, prompt, options):
+            yield rate_limited
+            raise RuntimeError("Claude Code returned an error result: success")
+
+        sdk.query = fake_query
+        import asyncio
+
+        first_assistant, last_result = asyncio.run(
+            mod._run_query(
+                model="claude-opus-4-6",
+                prompt="hi",
+                system_prompt="",
+                tool_bridge=None,
+                max_turns=1,
+            )
+        )
+        assert first_assistant is rate_limited
+        assert last_result is None
+
+    def test_reraises_when_nothing_was_captured(self, monkeypatch, _stub_claude_agent_sdk_module):
+        sdk = _stub_claude_agent_sdk_module
+
+        async def fake_query(*, prompt, options):
+            raise RuntimeError("boom before anything arrived")
+            yield  # pragma: no cover - makes this an async generator
+
+        sdk.query = fake_query
+        import asyncio
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(
+                mod._run_query(
+                    model="claude-opus-4-6",
+                    prompt="hi",
+                    system_prompt="",
+                    tool_bridge=None,
+                    max_turns=1,
+                )
+            )
 
 
 # ---------------------------------------------------------------------------

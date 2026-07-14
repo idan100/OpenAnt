@@ -41,9 +41,11 @@ Read this before touching the file:
      does NOT run real logic — real tool execution stays in
      OpenAnt's pipeline. The stub just returns an ack so Claude
      Code's loop can close out the turn; OpenAnt only ever reads the
-     **first** ``AssistantMessage`` (the ``ToolUseBlock`` it wanted)
-     and discards anything the SDK generates after feeding back that
-     stub result. ``max_turns`` bounds the wasted follow-up turn.
+     **first** ``AssistantMessage`` (the ``ToolUseBlock`` it wanted).
+     ``max_turns=1`` stops the SDK before it spends a whole extra
+     generation responding to that fake ack — measured live, that
+     discarded turn cost ~4x the useful one (subscription usage that
+     would otherwise be pure waste on every single tool call).
    * Claude Code's own built-in tools (Bash/Read/Write/...) are
      locked out (see ``_BUILTIN_TOOL_NAMES``) so a pipeline call never
      gets filesystem/shell access it didn't ask for.
@@ -221,13 +223,13 @@ class ClaudeSubscriptionAdapter:
         system_prompt = system if system is not None else ""
 
         tool_bridge = _build_tool_bridge(tools) if tools else None
-        # 1 turn when there's nothing to call (plain completion). With
-        # tools, allow a 2nd turn as slack: our tool stub returns an ack
-        # so Claude Code's loop can close turn 1 cleanly before hitting
-        # the cap, rather than the cap landing mid-tool-dispatch. Either
-        # way only the FIRST AssistantMessage is ever used — see module
-        # docstring point 2.
-        max_turns = 2 if tool_bridge else 1
+        # Always 1. Measured live: with max_turns=2, the discarded 2nd
+        # turn (the model responding to our fake tool-result ack) alone
+        # cost ~4x the useful 1st turn (3895+609 vs 848+9 tokens) — 100%
+        # wasted subscription usage, since only the FIRST AssistantMessage
+        # is ever used (see module docstring point 2). max_turns=1 stops
+        # the SDK before it starts that 2nd turn at all.
+        max_turns = 1
 
         try:
             first_assistant, last_result = asyncio.run(
@@ -413,19 +415,30 @@ async def _run_query(
 
     first_assistant = None
     last_result = None
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            # The SDK can yield a separate, thinking-only AssistantMessage
-            # BEFORE the one carrying the actual text/tool_use content
-            # (observed live: one message with only a ThinkingBlock, then
-            # a second with the ToolUseBlock). Skip past those — capturing
-            # the thinking-only one as `first_assistant` would leave
-            # `_translate` with nothing but a dropped ThinkingBlock and a
-            # false "empty completion" error.
-            if first_assistant is None and _has_substantive_content(message):
-                first_assistant = message
-        elif isinstance(message, ResultMessage):
-            last_result = message
+    try:
+        async for message in query(prompt=prompt, options=options):
+            if isinstance(message, AssistantMessage):
+                # The SDK can yield a separate, thinking-only AssistantMessage
+                # BEFORE the one carrying the actual text/tool_use content
+                # (observed live: one message with only a ThinkingBlock, then
+                # a second with the ToolUseBlock). Skip past those — capturing
+                # the thinking-only one as `first_assistant` would leave
+                # `_translate` with nothing but a dropped ThinkingBlock and a
+                # false "empty completion" error.
+                if first_assistant is None and _has_substantive_content(message):
+                    first_assistant = message
+            elif isinstance(message, ResultMessage):
+                last_result = message
+    except Exception:
+        # The SDK can raise mid-stream even after already giving us a
+        # decisive message — observed live: an AssistantMessage with
+        # error="rate_limit" (real subscription cap hit during testing),
+        # immediately followed by the generator raising a confusing
+        # internal exception while finishing up. Don't let that mask a
+        # clean, already-captured signal as a generic connection failure;
+        # only propagate if we truly got nothing usable.
+        if first_assistant is None:
+            raise
 
     return first_assistant, last_result
 
