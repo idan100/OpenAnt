@@ -359,6 +359,8 @@ class FindingVerifier:
         iterations = 0
         total_input_tokens = 0
         total_output_tokens = 0
+        total_cache_creation_tokens = 0
+        total_cache_read_tokens = 0
 
         while iterations < MAX_ITERATIONS:
             iterations += 1
@@ -376,6 +378,8 @@ class FindingVerifier:
 
             total_input_tokens += response.input_tokens
             total_output_tokens += response.output_tokens
+            total_cache_creation_tokens += response.cache_creation_input_tokens
+            total_cache_read_tokens += response.cache_read_input_tokens
 
             assistant_content = response.content
             stop_reason = response.stop_reason
@@ -384,7 +388,8 @@ class FindingVerifier:
             if stop_reason == "end_turn":
                 result = self._try_parse_text_response(
                     assistant_content, finding, iterations,
-                    total_input_tokens, total_output_tokens
+                    total_input_tokens, total_output_tokens,
+                    total_cache_creation_tokens, total_cache_read_tokens,
                 )
                 if result:
                     return result
@@ -445,6 +450,8 @@ class FindingVerifier:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    cache_creation_input_tokens=total_cache_creation_tokens,
+                    cache_read_input_tokens=total_cache_read_tokens,
                 )
                 return self._parse_finish_result(
                     finish_result, finding, iterations,
@@ -466,6 +473,8 @@ class FindingVerifier:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    cache_creation_input_tokens=total_cache_creation_tokens,
+                    cache_read_input_tokens=total_cache_read_tokens,
                 )
                 # Fail-safe (R4-7): see the :380 path above. Don't auto-agree;
                 # keep the Stage-1 verdict surfaced for human triage.
@@ -485,6 +494,8 @@ class FindingVerifier:
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
             pricing=lookup_pricing(self.binding),
+            cache_creation_input_tokens=total_cache_creation_tokens,
+            cache_read_input_tokens=total_cache_read_tokens,
         )
         # Fail-safe (R4-7): exhausting the iteration budget is not agreement.
         # Don't auto-agree; keep the Stage-1 verdict surfaced for human triage.
@@ -993,7 +1004,9 @@ class FindingVerifier:
         original_finding: str,
         iterations: int,
         total_input_tokens: int,
-        total_output_tokens: int
+        total_output_tokens: int,
+        total_cache_creation_tokens: int = 0,
+        total_cache_read_tokens: int = 0,
     ) -> Optional[VerificationResult]:
         """Try to parse a text response as JSON."""
         for block in assistant_content:
@@ -1005,6 +1018,8 @@ class FindingVerifier:
                         input_tokens=total_input_tokens,
                         output_tokens=total_output_tokens,
                         pricing=lookup_pricing(self.binding),
+                        cache_creation_input_tokens=total_cache_creation_tokens,
+                        cache_read_input_tokens=total_cache_read_tokens,
                     )
                     return self._parse_finish_result(
                         result, original_finding, iterations,

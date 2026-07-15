@@ -55,6 +55,8 @@ from ..adapter import (
 )
 
 
+_CACHE_CONTROL = {"type": "ephemeral"}
+
 _ANTHROPIC_STOP_REASONS: dict[str, StopReason] = {
     "end_turn": "end_turn",
     "tool_use": "tool_use",
@@ -184,9 +186,22 @@ class AnthropicAdapter:
             "messages": [_message_to_anthropic(m) for m in messages],
         }
         if system is not None:
-            request["system"] = system
+            # System prompt as a cached content block rather than a bare
+            # string. The agentic enhance/verify loops (agent.py,
+            # finding_verifier.py) resend this same system prompt on
+            # every iteration of every unit in a scan — caching it turns
+            # all but the first call into a ~90%-cheaper cache read.
+            request["system"] = [
+                {"type": "text", "text": system, "cache_control": _CACHE_CONTROL}
+            ]
         if tools:
-            request["tools"] = [_tool_to_anthropic(t) for t in tools]
+            anthropic_tools = [_tool_to_anthropic(t) for t in tools]
+            # Cache breakpoints are cumulative over the fixed
+            # tools -> system -> messages prefix order, so marking the
+            # last tool also covers every tool before it.
+            anthropic_tools[-1] = {**anthropic_tools[-1], "cache_control": _CACHE_CONTROL}
+            request["tools"] = anthropic_tools
+        _mark_cache_breakpoint(request["messages"])
 
         # Cooperate with the cross-worker backoff before issuing the
         # call — same pattern the legacy AnthropicClient used, now
@@ -303,6 +318,27 @@ def _block_to_anthropic(block: ContentBlock) -> dict[str, Any]:
     raise LLMResponseError(f"AnthropicAdapter: cannot serialise block of type {type(block).__name__}")
 
 
+def _mark_cache_breakpoint(anthropic_messages: list[dict[str, Any]]) -> None:
+    """Mark the end of the conversation-so-far as a cache breakpoint.
+
+    Agentic tool loops (ContextAgent, FindingVerifier) resend the entire
+    growing message history every iteration — turn N's request repeats
+    turns 1..N-1 verbatim, then appends the latest assistant/tool_result
+    turn. Marking the last content block of the last message means turn
+    N reads turns 1..N-1 from cache instead of paying full input price
+    for them again, with each turn's response re-marking the new tail
+    for the next iteration. Blocks under the provider's minimum
+    cacheable length (~1024 tokens) are silently not cached by the API,
+    so marking short single-turn requests too is harmless.
+    """
+    if not anthropic_messages:
+        return
+    last_content = anthropic_messages[-1]["content"]
+    if not last_content:
+        return
+    last_content[-1] = {**last_content[-1], "cache_control": _CACHE_CONTROL}
+
+
 def _tool_to_anthropic(tool: ToolDef) -> dict[str, Any]:
     return {
         "name": tool.name,
@@ -388,6 +424,8 @@ def _response_to_unified(response: Any) -> CompletionResult:
         content=content_blocks,
         input_tokens=getattr(usage, "input_tokens", 0),
         output_tokens=getattr(usage, "output_tokens", 0),
+        cache_creation_input_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        cache_read_input_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
         stop_reason=_ANTHROPIC_STOP_REASONS.get(raw_stop, "end_turn"),
         raw=response,
     )

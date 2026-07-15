@@ -18,6 +18,25 @@ from __future__ import annotations
 import re
 
 
+def cap_code(text: str, limit: int = 60_000) -> str:
+    """Truncate ``text`` to ``limit`` chars with an explicit truncation marker.
+
+    Analyzed source code reaches these prompts with no inherent size bound:
+    the agentic enhancer (``agentic_enhancer/agent.py``) can inline an
+    unbounded number of dependency functions into a unit's ``primary_code``,
+    and that same blob is then sent to both Stage 1 (analysis) and Stage 2
+    (verification, one call per unit, up to ``MAX_ITERATIONS`` times).
+    ~4 chars/token, so 60k chars stays well under the model's context window
+    per call. Truncating (rather than erroring) keeps the pipeline running on
+    oversized units; the explicit marker stops the model from reasoning over
+    partial code as if it were complete.
+    """
+    if not text or len(text) <= limit:
+        return text or ""
+    marker = "\n... (truncated)"
+    return text[: limit - len(marker)] + marker
+
+
 def safe_code_fence(text: str) -> str:
     """Return a backtick run guaranteed to enclose ``text`` un-escapably.
 

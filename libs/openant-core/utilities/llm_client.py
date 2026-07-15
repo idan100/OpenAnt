@@ -38,6 +38,14 @@ MODEL_PRICING = {
     "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
 }
 
+# Anthropic prompt-cache pricing, as a multiplier of the model's base
+# input rate. Fixed ratios for the default 5-minute ephemeral cache,
+# identical across every Claude model, so they live here rather than
+# per-model in MODEL_PRICING. See
+# https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+CACHE_WRITE_MULTIPLIER = 1.25
+CACHE_READ_MULTIPLIER = 0.1
+
 _unknown_pricing_warned: set[str] = set()
 _unknown_pricing_lock = threading.Lock()
 
@@ -70,7 +78,10 @@ class TokenTracker:
             self.calls = []
             self.total_input_tokens = 0
             self.total_output_tokens = 0
+            self.total_cache_creation_tokens = 0
+            self.total_cache_read_tokens = 0
             self.total_cost_usd = 0.0
+            self.total_cache_savings_usd = 0.0
 
     @property
     def total_tokens(self) -> int:
@@ -84,13 +95,16 @@ class TokenTracker:
         output_tokens: int,
         *,
         pricing: dict[str, float] | None = None,
+        cache_creation_input_tokens: int = 0,
+        cache_read_input_tokens: int = 0,
     ) -> dict:
         """
         Record a single LLM call.
 
         Args:
             model: Model identifier.
-            input_tokens: Number of input tokens.
+            input_tokens: Number of input tokens billed at the full
+                input rate (excludes cached tokens).
             output_tokens: Number of output tokens.
             pricing: Optional ``{"input": $/Mtok, "output": $/Mtok}``
                 from the adapter that made the call. When provided,
@@ -101,6 +115,14 @@ class TokenTracker:
                 (with a one-time stderr warning on miss). New code
                 should always pass ``pricing`` via
                 ``binding.adapter.pricing.get(binding.model)``.
+            cache_creation_input_tokens: Tokens written to the prompt
+                cache on this call (billed at ``CACHE_WRITE_MULTIPLIER``
+                of the input rate). ``0`` when the call didn't use
+                caching.
+            cache_read_input_tokens: Tokens served from the prompt
+                cache on this call (billed at ``CACHE_READ_MULTIPLIER``
+                of the input rate). ``0`` when the call didn't use
+                caching.
 
         Returns:
             Dict with call details including cost.
@@ -110,16 +132,32 @@ class TokenTracker:
         if pricing is None:
             _warn_unknown_pricing(model)
             total_cost = 0.0
+            cache_savings_usd = 0.0
         else:
             input_cost = (input_tokens / 1_000_000) * pricing["input"]
             output_cost = (output_tokens / 1_000_000) * pricing["output"]
-            total_cost = input_cost + output_cost
+            cache_write_cost = (
+                (cache_creation_input_tokens / 1_000_000) * pricing["input"] * CACHE_WRITE_MULTIPLIER
+            )
+            cache_read_cost = (
+                (cache_read_input_tokens / 1_000_000) * pricing["input"] * CACHE_READ_MULTIPLIER
+            )
+            total_cost = input_cost + output_cost + cache_write_cost + cache_read_cost
+            # What those cache-read tokens would have cost at the full
+            # input rate, minus what they actually cost — i.e. the
+            # dollar amount caching saved on this call.
+            cache_savings_usd = (
+                (cache_read_input_tokens / 1_000_000) * pricing["input"] * (1 - CACHE_READ_MULTIPLIER)
+            )
 
         call_record = {
             "model": model,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "cost_usd": round(total_cost, 6)
+            "cache_creation_input_tokens": cache_creation_input_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+            "cost_usd": round(total_cost, 6),
+            "cache_savings_usd": round(cache_savings_usd, 6),
         }
 
         # Update totals (thread-safe)
@@ -127,7 +165,10 @@ class TokenTracker:
             self.calls.append(call_record)
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
+            self.total_cache_creation_tokens += cache_creation_input_tokens
+            self.total_cache_read_tokens += cache_read_input_tokens
             self.total_cost_usd += total_cost
+            self.total_cache_savings_usd += cache_savings_usd
 
         # Accumulate to thread-local unit tracking if active
         tl = self._thread_local
@@ -170,6 +211,26 @@ class TokenTracker:
             "cost_usd": round(getattr(tl, "unit_cost", 0.0), 6),
         }
 
+    def _cache_metrics_locked(self) -> dict:
+        """Cache-related totals. Caller must hold ``self._lock``.
+
+        ``cache_hit_rate`` is the fraction of all input tokens processed
+        (fresh + cache-write + cache-read) that were served from cache —
+        the "percentage reduction" figure for prompt caching.
+        """
+        processed = (
+            self.total_input_tokens
+            + self.total_cache_creation_tokens
+            + self.total_cache_read_tokens
+        )
+        hit_rate = (self.total_cache_read_tokens / processed) if processed else 0.0
+        return {
+            "cache_creation_input_tokens": self.total_cache_creation_tokens,
+            "cache_read_input_tokens": self.total_cache_read_tokens,
+            "cache_hit_rate": round(hit_rate, 4),
+            "cache_savings_usd": round(self.total_cache_savings_usd, 6),
+        }
+
     def get_summary(self) -> dict:
         """
         Get summary of all tracked calls.
@@ -184,6 +245,7 @@ class TokenTracker:
                 "total_output_tokens": self.total_output_tokens,
                 "total_tokens": self.total_input_tokens + self.total_output_tokens,
                 "total_cost_usd": round(self.total_cost_usd, 6),
+                **self._cache_metrics_locked(),
                 "calls": list(self.calls),
             }
 
@@ -201,6 +263,7 @@ class TokenTracker:
                 "total_output_tokens": self.total_output_tokens,
                 "total_tokens": self.total_input_tokens + self.total_output_tokens,
                 "total_cost_usd": round(self.total_cost_usd, 6),
+                **self._cache_metrics_locked(),
             }
 
 

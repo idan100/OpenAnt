@@ -230,6 +230,8 @@ class ContextAgent:
         iterations = 0
         total_input_tokens = 0
         total_output_tokens = 0
+        total_cache_creation_tokens = 0
+        total_cache_read_tokens = 0
 
         while iterations < MAX_ITERATIONS:
             iterations += 1
@@ -264,6 +266,8 @@ class ContextAgent:
             # Track tokens
             total_input_tokens += result.input_tokens
             total_output_tokens += result.output_tokens
+            total_cache_creation_tokens += result.cache_creation_input_tokens
+            total_cache_read_tokens += result.cache_read_input_tokens
 
             # Process response
             assistant_content = result.content
@@ -346,6 +350,8 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    cache_creation_input_tokens=total_cache_creation_tokens,
+                    cache_read_input_tokens=total_cache_read_tokens,
                 )
 
                 return AgentResult(
@@ -401,6 +407,8 @@ class ContextAgent:
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
             pricing=lookup_pricing(self.binding),
+            cache_creation_input_tokens=total_cache_creation_tokens,
+            cache_read_input_tokens=total_cache_read_tokens,
         )
 
         return AgentResult(

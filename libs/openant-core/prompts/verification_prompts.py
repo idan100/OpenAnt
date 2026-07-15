@@ -9,7 +9,7 @@ Supports optional application context to reduce false positives.
 
 from typing import TYPE_CHECKING
 
-from prompts._fence import safe_code_fence
+from prompts._fence import cap_code, safe_code_fence
 
 if TYPE_CHECKING:
     from context.application_context import ApplicationContext
@@ -122,8 +122,8 @@ def get_verification_prompt(
     )
     code_parts = code.split("// ========== File Boundary ==========")
     if len(code_parts) > 1:
-        primary_code = code_parts[0].strip()
-        context_code = "\n// ========== File Boundary ==========".join(code_parts[1:])
+        primary_code = cap_code(code_parts[0].strip())
+        context_code = cap_code("\n// ========== File Boundary ==========".join(code_parts[1:]))
         # One fence long enough to safely enclose either block.
         fence = _fence_for(primary_code + "\n" + context_code)
         code_section = f"""
@@ -139,6 +139,7 @@ Context:
 {context_code}
 {fence}"""
     else:
+        code = cap_code(code)
         fence = _fence_for(code)
         code_section = f"""
 {untrusted_note}

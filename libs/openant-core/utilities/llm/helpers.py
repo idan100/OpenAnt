@@ -79,6 +79,8 @@ def simple_text(
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
         pricing=lookup_pricing(binding),
+        cache_creation_input_tokens=result.cache_creation_input_tokens,
+        cache_read_input_tokens=result.cache_read_input_tokens,
     )
 
     return "\n".join(

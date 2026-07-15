@@ -86,8 +86,20 @@ class TestRequestTranslation:
         assert kwargs["model"] == "claude-test"
         assert kwargs["max_tokens"] == 64
         assert "system" not in kwargs  # omit when None, don't pass system=None
+        # Last content block of the last message always carries a cache
+        # breakpoint (see TestPromptCaching) — below the provider's minimum
+        # cacheable length, it's simply not cached.
         assert kwargs["messages"] == [
-            {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "hello",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            }
         ]
         assert "tools" not in kwargs
 
@@ -99,7 +111,15 @@ class TestRequestTranslation:
             messages=[Message(role="user", content=[TextBlock("hi")])],
             max_tokens=8,
         )
-        assert client.messages.create.call_args.kwargs["system"] == "You are helpful."
+        # System is sent as a cached content block, not a bare string —
+        # see TestPromptCaching for why.
+        assert client.messages.create.call_args.kwargs["system"] == [
+            {
+                "type": "text",
+                "text": "You are helpful.",
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
 
     def test_tool_definitions_serialised(self):
         adapter, client = _stub_adapter(lambda **kw: _ok_response())
@@ -122,6 +142,7 @@ class TestRequestTranslation:
                 "name": "search",
                 "description": "Search the index",
                 "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+                "cache_control": {"type": "ephemeral"},
             }
         ]
 
@@ -161,7 +182,8 @@ class TestRequestTranslation:
                 }
             ],
         }
-        # Following user turn carries tool_result with matching id.
+        # Following user turn carries tool_result with matching id, and
+        # (being the last message) the cache breakpoint.
         assert messages[2] == {
             "role": "user",
             "content": [
@@ -169,9 +191,64 @@ class TestRequestTranslation:
                     "type": "tool_result",
                     "tool_use_id": "toolu_1",
                     "content": '"hi"',
+                    "cache_control": {"type": "ephemeral"},
                 }
             ],
         }
+
+
+# ---------------------------------------------------------------------------
+# Prompt caching
+# ---------------------------------------------------------------------------
+#
+# agent.py and finding_verifier.py run agentic tool-use loops that resend
+# the full system prompt, tool schemas, and growing message history on
+# every iteration. These tests pin down where cache breakpoints land so a
+# refactor can't silently stop caching them.
+
+
+class TestPromptCaching:
+    def test_only_last_message_gets_cache_breakpoint(self):
+        """A multi-turn history must cache only the newest tail, not
+        every turn — re-marking every message would waste breakpoints
+        (max 4 per request) and doesn't match how Anthropic's cache
+        actually reads a matching prefix."""
+        adapter, client = _stub_adapter(lambda **kw: _ok_response())
+        adapter.complete(
+            model="claude-test",
+            system=None,
+            messages=[
+                Message(role="user", content=[TextBlock("first")]),
+                Message(role="assistant", content=[TextBlock("second")]),
+                Message(role="user", content=[TextBlock("third")]),
+            ],
+            max_tokens=8,
+        )
+        messages = client.messages.create.call_args.kwargs["messages"]
+        assert "cache_control" not in messages[0]["content"][0]
+        assert "cache_control" not in messages[1]["content"][0]
+        assert messages[2]["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_no_system_no_tools_only_message_breakpoint(self):
+        adapter, client = _stub_adapter(lambda **kw: _ok_response())
+        adapter.complete(
+            model="claude-test",
+            system=None,
+            messages=[Message(role="user", content=[TextBlock("hi")])],
+            max_tokens=8,
+        )
+        kwargs = client.messages.create.call_args.kwargs
+        assert "system" not in kwargs
+        assert "tools" not in kwargs
+        assert kwargs["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_empty_message_list_does_not_error(self):
+        # Defensive: complete() always sends at least one message in
+        # practice, but the breakpoint helper must not blow up if it
+        # ever doesn't.
+        adapter, client = _stub_adapter(lambda **kw: _ok_response())
+        adapter.complete(model="claude-test", system=None, messages=[], max_tokens=8)
+        assert client.messages.create.call_args.kwargs["messages"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +326,43 @@ class TestResponseTranslation:
         assert len(result.content) == 1
         assert isinstance(result.content[0], TextBlock)
         assert result.content[0].text == "visible"
+
+    def test_cache_usage_extracted_from_response(self):
+        def respond(**kw):
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="hi")],
+                usage=SimpleNamespace(
+                    input_tokens=5,
+                    output_tokens=2,
+                    cache_creation_input_tokens=1200,
+                    cache_read_input_tokens=800,
+                ),
+                stop_reason="end_turn",
+            )
+
+        adapter, _ = _stub_adapter(respond)
+        result = adapter.complete(
+            model="claude-test",
+            system=None,
+            messages=[Message(role="user", content=[TextBlock("hi")])],
+            max_tokens=8,
+        )
+        assert result.cache_creation_input_tokens == 1200
+        assert result.cache_read_input_tokens == 800
+
+    def test_cache_usage_defaults_to_zero_when_absent(self):
+        # A response usage object without cache fields (e.g. an
+        # Anthropic-compat proxy that doesn't support caching) must not
+        # crash the getattr lookups.
+        adapter, _ = _stub_adapter(lambda **kw: _ok_response())
+        result = adapter.complete(
+            model="claude-test",
+            system=None,
+            messages=[Message(role="user", content=[TextBlock("hi")])],
+            max_tokens=8,
+        )
+        assert result.cache_creation_input_tokens == 0
+        assert result.cache_read_input_tokens == 0
 
     def test_raw_response_preserved(self):
         sentinel = _ok_response(text="hi")

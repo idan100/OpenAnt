@@ -189,8 +189,18 @@ class CompletionResult:
             tuple so accidental mutation by callers becomes a
             ``TypeError`` (matches the immutability invariant
             ``Message.content`` already enforces).
-        input_tokens: From the provider's usage metadata.
+        input_tokens: From the provider's usage metadata. Tokens
+            billed at the full input rate — excludes any tokens
+            served from or written to a prompt cache.
         output_tokens: Ditto.
+        cache_creation_input_tokens: Tokens written to the provider's
+            prompt cache on this call (billed at a premium over the
+            base input rate). ``0`` for adapters/providers that don't
+            support prompt caching.
+        cache_read_input_tokens: Tokens served from the provider's
+            prompt cache on this call (billed at a discount off the
+            base input rate). ``0`` for adapters/providers that don't
+            support prompt caching.
         stop_reason: Normalised across providers. The pipeline's
             agentic loops branch on ``"tool_use"`` to know whether
             to execute tools and continue.
@@ -203,6 +213,8 @@ class CompletionResult:
     input_tokens: int
     output_tokens: int
     stop_reason: StopReason
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
     raw: Any = field(default=None, repr=False)
 
     def __post_init__(self):
