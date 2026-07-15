@@ -85,6 +85,10 @@ class AnalysisMetrics:
     # potential vulnerabilities awaiting manual review — they must NOT be
     # folded into ``safe``.
     needs_review: int = 0
+    # Units whose Stage 1 verdict was reused from the exact-duplicate
+    # response cache (experiment.analyze_unit) instead of a fresh API call —
+    # see experiment.py's _analyze_response_cache for what "exact" means.
+    cache_hits: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)

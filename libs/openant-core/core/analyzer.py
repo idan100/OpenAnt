@@ -39,6 +39,7 @@ from utilities.json_corrector import JSONCorrector
 from utilities.rate_limiter import get_rate_limiter, is_rate_limit_error, is_retryable_error
 
 # Reuse the core analysis functions from experiment.py
+import experiment as experiment_module
 from experiment import (
     analyze_unit,
     parse_response,
@@ -378,6 +379,12 @@ def run_analysis(
     """
     os.makedirs(output_dir, exist_ok=True)
 
+    # Fresh exact-duplicate cache per run so the cache_hits metric below
+    # reflects THIS run, not leftovers from an earlier run_analysis() call
+    # in the same process (checkpoint-restored units never touch this
+    # cache, so resetting it never discards real work).
+    experiment_module.reset_analyze_cache()
+
     # Configure global rate limiter
     from utilities.rate_limiter import configure_rate_limiter
     configure_rate_limiter(backoff_seconds=float(backoff_seconds))
@@ -618,6 +625,13 @@ def run_analysis(
     # Checkpoints are preserved as a permanent artifact alongside results.
     # Final summary (phase="done") was already written before result writing.
 
+    if experiment_module.analyze_cache_hits:
+        print(
+            f"[Analyze] Exact-duplicate cache: {experiment_module.analyze_cache_hits} "
+            f"unit(s) reused a prior verdict instead of a new API call",
+            file=sys.stderr,
+        )
+
     # Build return value
     usage = tracking.get_usage()
     metrics = AnalysisMetrics(
@@ -628,6 +642,7 @@ def run_analysis(
         protected=counts["protected"],
         safe=counts["safe"],
         errors=counts["errors"],
+        cache_hits=experiment_module.analyze_cache_hits,
     )
 
     return AnalyzeResult(

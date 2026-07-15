@@ -28,9 +28,11 @@ Output:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -329,6 +331,54 @@ def parse_response(response: str) -> dict:
         }
 
 
+# Exact-duplicate response cache for Stage 1 detection, keyed on everything
+# that materially affects the model's reasoning: the (capped) code text,
+# the enhance-phase classification hint, and the system prompt (which
+# already encodes app_context). Two units collide here only when the model
+# would reach the same verdict for the same reasons, so a hit means "already
+# answered", not a guess.
+#
+# Deliberately EXCLUDES route/unit-id and files_included: those are
+# per-unit bookkeeping that differ for nearly every unit by construction
+# (route defaults to the unit's own id when there's no real HTTP route), so
+# folding them into the key would make byte-identical duplicated code
+# (copy-pasted boilerplate, vendored files) never collide — exactly the
+# case this cache exists to catch. files_included is redundant with code
+# anyway: it's metadata about files already inlined into the code string.
+#
+# Process-lifetime, in-memory only (a fresh `openant analyze` subprocess
+# starts empty); this also short-circuits the class of cross-unit verdict
+# inconsistency `FindingVerifier._check_consistency` otherwise has to detect
+# and repair after the fact with another LLM call — identical inputs can't
+# disagree with each other if there's only ever one answer to reuse.
+# ponytail: unbounded for the life of the process; add an LRU cap if a very
+# long-running autopilot run ever makes this a real memory concern.
+_analyze_response_cache: dict[str, str] = {}
+_analyze_response_cache_lock = threading.Lock()
+analyze_cache_hits = 0
+
+
+def _analyze_cache_key(system_prompt: str, code: str, security_classification, classification_reasoning) -> str:
+    digest = hashlib.sha256()
+    for part in (system_prompt, code, security_classification, classification_reasoning):
+        digest.update(("" if part is None else str(part)).encode("utf-8"))
+        digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+def reset_analyze_cache() -> None:
+    """Clear the Stage 1 exact-duplicate response cache and hit counter.
+
+    Matches the ``reset_global_tracker()``/``reset_warning_state()`` pattern
+    in ``utilities/llm_client.py`` — tests (and any fresh scan process) want
+    a clean slate rather than leaking cached responses across runs.
+    """
+    global analyze_cache_hits
+    with _analyze_response_cache_lock:
+        _analyze_response_cache.clear()
+        analyze_cache_hits = 0
+
+
 def analyze_unit(
     binding: PhaseBinding,
     unit: dict,
@@ -415,7 +465,19 @@ def analyze_unit(
     # Call the configured analyze-phase model with the threat-model system prompt.
     start_time = datetime.now()
     system_prompt = get_stage1_system_prompt(app_context=app_context)
-    response = simple_text(binding, prompt, system=system_prompt)
+
+    cache_key = _analyze_cache_key(system_prompt, code, security_classification, classification_reasoning)
+    with _analyze_response_cache_lock:
+        cached_response = _analyze_response_cache.get(cache_key)
+    if cached_response is not None:
+        global analyze_cache_hits
+        with _analyze_response_cache_lock:
+            analyze_cache_hits += 1
+        response = cached_response
+    else:
+        response = simple_text(binding, prompt, system=system_prompt)
+        with _analyze_response_cache_lock:
+            _analyze_response_cache[cache_key] = response
     elapsed = (datetime.now() - start_time).total_seconds()
 
     # Parse response
