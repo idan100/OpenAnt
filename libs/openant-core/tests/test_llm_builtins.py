@@ -43,27 +43,25 @@ class TestOpenantDefault:
             )
 
     def test_historical_model_assignment(self):
-        # Pin today's behavior. If Anthropic deprecates one of these
-        # IDs, this test breaks loudly and the change is recorded in
-        # the CHANGELOG.
-        assert OPENANT_DEFAULT.phases["analyze"].model == "claude-opus-4-6"
-        assert OPENANT_DEFAULT.phases["verify"].model == "claude-opus-4-6"
-        assert OPENANT_DEFAULT.phases["llm_reach"].model == "claude-opus-4-6"
-        # report restored to Opus (H1) — matches master's report generator.
-        assert OPENANT_DEFAULT.phases["report"].model == "claude-opus-4-6"
-        assert OPENANT_DEFAULT.phases["enhance"].model == "claude-sonnet-4-20250514"
-        assert OPENANT_DEFAULT.phases["dynamic_test"].model == "claude-sonnet-4-20250514"
-        assert OPENANT_DEFAULT.phases["app_context"].model == "claude-sonnet-4-20250514"
+        # Pin today's behavior. If Anthropic deprecates this ID, this
+        # test breaks loudly and the change is recorded in the CHANGELOG.
+        #
+        # Every phase on Claude Sonnet 5 (user-requested default) —
+        # previously a per-phase Opus/Sonnet-4 split. Sonnet 5 closes
+        # most of the Opus reasoning gap at a fraction of the per-token
+        # cost, so one model everywhere replaced the split entirely.
+        for phase in PHASES:
+            assert OPENANT_DEFAULT.phases[phase].model == "claude-sonnet-5", (
+                f"phase {phase!r} should default to claude-sonnet-5"
+            )
 
-    def test_report_phase_defaults_to_opus(self):
-        # H1 drift-guard. Master's report/generator.py used
-        # MODEL="claude-opus-4-6"; the LLM-provider refactor silently
-        # moved the builtin ``report`` default to Sonnet. Restore Opus so
-        # the HTML-remediation / summary / disclosure sub-calls keep
-        # producing Opus-quality output on a fresh, config-less install.
-        # If you intend to change the report default, that is a
+    def test_report_phase_defaults_to_sonnet_5(self):
+        # Was pinned to Opus (H1 drift-guard) so report generation kept
+        # Opus-quality output on a fresh install. Deliberately changed:
+        # every phase, including report, now defaults to Sonnet 5. If you
+        # intend to change the report default again, that is a
         # CHANGELOG-worthy event — update this assertion deliberately.
-        assert OPENANT_DEFAULT.phases["report"].model == "claude-opus-4-6"
+        assert OPENANT_DEFAULT.phases["report"].model == "claude-sonnet-5"
 
     def test_accessor_returns_same_object(self):
         # Frozen dataclass, but if a future refactor turns it into a

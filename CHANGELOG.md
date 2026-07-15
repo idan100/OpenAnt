@@ -3,6 +3,29 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-07-16] — `openant-default` moves to Claude Sonnet 5 across every phase
+
+### Changed
+
+- **Built-in default config is now Sonnet 5 everywhere.** `openant-default`
+  previously split phases between Opus (`analyze`, `verify`, `llm_reach`,
+  `report`) and Sonnet 4 (`enhance`, `dynamic_test`, `app_context`).
+  Every phase now defaults to `claude-sonnet-5`. Sonnet 5 closes most of
+  the Opus reasoning gap at a fraction of the per-token cost, so one
+  model everywhere replaced the split. Fresh installs and any existing
+  install without a custom `llm_configs` entry pick this up on the next
+  `openant scan`. `openant setup llm`'s per-phase wizard defaults for the
+  `anthropic` / `claude_subscription` provider types were updated to
+  match, so the wizard and the zero-config path agree; `openai` / `google`
+  wizard defaults are unchanged.
+- Added `claude-sonnet-5` pricing ($3.00 / $15.00 per MTok input/output)
+  to both `AnthropicAdapter.pricing` and the legacy `MODEL_PRICING`
+  mirror in `utilities/llm_client.py`.
+- Users who want the old per-phase Opus/Sonnet split back: copy
+  `openant-default` to a named config (`openant llm-config copy
+  openant-default my-config`) and edit the per-phase models by hand, or
+  run `openant setup llm`.
+
 ## [2026-05-24] — Pluggable LLM providers (per-phase llm-configs)
 
 ### Added

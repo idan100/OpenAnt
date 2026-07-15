@@ -129,6 +129,10 @@ class AnthropicAdapter:
         "claude-opus-4-20250514": {"input": 15.00, "output": 75.00},
         "claude-opus-4-6": {"input": 15.00, "output": 75.00},
         "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+        # Standard rate; Anthropic is running an introductory $2/$10 rate
+        # through 2026-08-31 — not reflected here since this table has no
+        # expiry tracking and the standard rate is what applies afterward.
+        "claude-sonnet-5": {"input": 3.00, "output": 15.00},
         "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
     }
 

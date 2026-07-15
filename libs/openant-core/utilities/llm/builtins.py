@@ -20,7 +20,7 @@ registry.
 
 from __future__ import annotations
 
-from .config import LLMConfig, PhaseRef
+from .config import PHASES, LLMConfig, PhaseRef
 
 
 # Provider name referenced by every phase. Synthesised from the
@@ -29,32 +29,19 @@ from .config import LLMConfig, PhaseRef
 _ANTHROPIC_PROVIDER = "anthropic"
 
 
-# Per-phase Claude defaults — preserves today's behavior on upgrade.
+# Every phase on Claude Sonnet 5 — the user-requested default for this
+# version of OpenAnt. Previously a per-phase Opus/Sonnet split (Opus for
+# analyze/verify/llm_reach/report, Sonnet 4 for the rest); Sonnet 5 closes
+# most of that reasoning gap at a fraction of Opus's per-token cost, so a
+# single model everywhere is both simpler and cheaper.
 # When this file changes, the CHANGELOG must say so, because every
 # existing user without a custom llm-config picks up the new IDs on
 # the next ``openant scan``.
 OPENANT_DEFAULT = LLMConfig(
     name="openant-default",
     phases={
-        # Stage 1 detection. Opus by historical default.
-        "analyze": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-opus-4-6"),
-        # Context enhancement (agentic + single-shot). Sonnet for cost.
-        "enhance": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-4-20250514"),
-        # Stage 2 attacker simulation. Opus, uses tool calling.
-        "verify": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-opus-4-6"),
-        # Disclosure + summary + remediation HTML generation. Opus —
-        # matches master's report/generator.py (MODEL="claude-opus-4-6").
-        # The refactor briefly moved this to Sonnet; restored so the
-        # report output (incl. the HTML-remediation sub-call) stays on
-        # Opus on a fresh, config-less install.
-        "report": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-opus-4-6"),
-        # Docker exploit-test generation. Sonnet.
-        "dynamic_test": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-4-20250514"),
-        # LLM-driven reachability review (opt-in stage). Opus.
-        "llm_reach": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-opus-4-6"),
-        # Application-context classification (web_app / cli_tool / etc).
-        # Single-shot, runs once per scan during ``openant scan``. Sonnet.
-        "app_context": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-4-20250514"),
+        phase: PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-5")
+        for phase in PHASES
     },
 )
 
