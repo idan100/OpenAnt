@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
 
+from prompts._fence import cap_code
 from .llm_client import TokenTracker, get_global_tracker, reset_global_tracker
 from .llm import (
     LLMAuthError,
@@ -141,6 +142,14 @@ def get_context_enhancement_prompt(
     """
     deps_list = "\n".join(f"- {d}" for d in static_deps) if static_deps else "- None identified"
     callers_list = "\n".join(f"- {c}" for c in static_callers) if static_callers else "- None identified"
+
+    # function_code is a unit's assembled primary_code, which the agentic
+    # enhancer can inline arbitrarily many dependency functions into with
+    # no size limit (agentic_enhancer/agent.py) — same unbounded-input class
+    # already fixed for the Stage 1/Stage 2 prompt builders. Cap it here too:
+    # this single-shot enhance path sends its own uncapped copy of that
+    # field to Claude, once per unit across the whole dataset.
+    function_code = cap_code(function_code)
 
     context_section = ""
     if context_functions:

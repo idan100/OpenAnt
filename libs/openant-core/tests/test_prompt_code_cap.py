@@ -16,6 +16,7 @@ from __future__ import annotations
 from prompts._fence import cap_code
 from prompts.verification_prompts import get_verification_prompt
 from prompts.vulnerability_analysis import get_analysis_prompt
+from utilities.context_enhancer import get_context_enhancement_prompt
 
 
 class TestCapCode:
@@ -54,6 +55,38 @@ class TestAnalysisPromptCapsCode:
         assert primary in prompt
         assert "y" * 200_000 not in prompt
         assert "(truncated)" in prompt
+
+
+class TestContextEnhancementPromptCapsCode:
+    # Single-shot (non-agentic) enhance mode — utilities/context_enhancer.py.
+    # Separate call site, separate cap enforcement point from Stage 1/2.
+    def test_oversized_function_code_capped(self):
+        prompt = get_context_enhancement_prompt(
+            function_id="a.js:fn",
+            function_name="fn",
+            function_code="x" * 200_000,
+            unit_type="function",
+            class_name=None,
+            static_deps=[],
+            static_callers=[],
+            context_functions=[],
+        )
+        assert "x" * 200_000 not in prompt
+        assert "(truncated)" in prompt
+
+    def test_short_function_code_untouched(self):
+        prompt = get_context_enhancement_prompt(
+            function_id="a.js:fn",
+            function_name="fn",
+            function_code="function fn() { return 1; }",
+            unit_type="function",
+            class_name=None,
+            static_deps=[],
+            static_callers=[],
+            context_functions=[],
+        )
+        assert "function fn() { return 1; }" in prompt
+        assert "(truncated)" not in prompt
 
 
 class TestVerificationPromptCapsCode:
