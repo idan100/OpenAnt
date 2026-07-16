@@ -13,6 +13,8 @@ Public API:
 import json
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utilities.dynamic_tester.models import DynamicTestResult
 from utilities.dynamic_tester.test_generator import generate_test, regenerate_test
@@ -29,6 +31,100 @@ from utilities.llm import (
 from utilities.file_io import read_json, write_json, open_utf8
 
 
+def _process_one_finding(
+    index: int,
+    total: int,
+    finding: dict,
+    finding_id: str,
+    repo_info: dict,
+    repo_path: str | None,
+    dynamic_test_binding,
+    tracker,
+    max_retries: int,
+) -> DynamicTestResult:
+    """Generate + run (with error-feedback retries) the dynamic test for one
+    finding. No shared mutable state besides ``tracker``, which is safe for
+    concurrent callers: ``start_unit_tracking()``/``get_unit_usage()`` key off
+    ``threading.local()``, so each worker thread gets its own accumulator.
+    """
+    print(f"\n[{index + 1}/{total}] Testing {finding_id}: "
+          f"{finding.get('name', 'unknown')}...", file=sys.stderr)
+
+    tracker.start_unit_tracking()
+
+    print("  Generating test...", file=sys.stderr)
+    generation = generate_test(finding, repo_info, dynamic_test_binding, tracker)
+    unit_usage = tracker.get_unit_usage()
+    generation_cost = unit_usage["cost_usd"]
+
+    if generation is None:
+        print("  Test generation failed.", file=sys.stderr)
+        result = collect_result(finding, None, None, generation_cost)
+        result.generation_input_tokens = unit_usage["input_tokens"]
+        result.generation_output_tokens = unit_usage["output_tokens"]
+        return result
+
+    print(f"  Generated (${generation_cost:.4f}). Running in Docker...",
+          file=sys.stderr)
+
+    # Resolve the vulnerable source file for pre-staging.
+    source_file = None
+    if repo_path:
+        rel_path = finding.get("location", {}).get("file", "")
+        if rel_path:
+            candidate = os.path.join(repo_path, rel_path)
+            if os.path.isfile(candidate):
+                source_file = candidate
+
+    execution = run_single_container(generation, finding_id, source_file=source_file)
+    result = collect_result(finding, generation, execution, generation_cost)
+    retry_count = 0
+
+    while result.status == "ERROR" and retry_count < max_retries:
+        if execution.build_error:
+            error_msg = execution.build_error
+            error_type = "Build"
+        elif execution.exit_code != 0 and execution.stderr:
+            error_msg = execution.stderr
+            error_type = "Runtime"
+        else:
+            error_msg = result.details
+            error_type = "Application"
+
+        if execution.timed_out:
+            print(f"  Timed out — not retrying.", file=sys.stderr)
+            break
+
+        retry_count += 1
+        print(f"  {error_type} error. Retry {retry_count}/{max_retries} "
+              f"with error feedback...", file=sys.stderr)
+
+        retry_gen = regenerate_test(
+            finding, repo_info, generation,
+            error_msg, dynamic_test_binding, tracker,
+        )
+        unit_usage = tracker.get_unit_usage()
+        generation_cost = unit_usage["cost_usd"]
+
+        if retry_gen is None:
+            print(f"  Retry generation failed.", file=sys.stderr)
+            break
+
+        generation = retry_gen
+        execution = run_single_container(generation, finding_id, source_file=source_file)
+        result = collect_result(finding, generation, execution, generation_cost)
+        print(f"  Retry {retry_count} result: {result.status} "
+              f"(${generation_cost:.4f})", file=sys.stderr)
+
+    result.retry_count = retry_count
+    result.generation_input_tokens = unit_usage["input_tokens"]
+    result.generation_output_tokens = unit_usage["output_tokens"]
+
+    print(f"  Result: {result.status} ({result.elapsed_seconds:.1f}s)",
+          file=sys.stderr)
+    return result
+
+
 def run_dynamic_tests(
     pipeline_output_path: str,
     output_dir: str | None = None,
@@ -37,6 +133,7 @@ def run_dynamic_tests(
     repo_path: str | None = None,
     registry: PhaseRegistry | None = None,
     llm_config_name: str | None = None,
+    workers: int = 4,
 ) -> list[DynamicTestResult]:
     """Run dynamic tests for all findings in a pipeline output file.
 
@@ -49,6 +146,13 @@ def run_dynamic_tests(
         repo_path: Path to the repository root. When given, the vulnerable
             source file is pre-staged into the Docker build context so
             ``COPY <filename> .`` works on the first try.
+        workers: Number of findings to test in parallel (default 4). Each
+            finding gets its own uniquely-named Docker image/network/work
+            dir (see docker_executor.run_single_container), so concurrent
+            runs don't collide. Lower than the 8 used for pure-API phases
+            (enhance/analyze/verify) since Docker build+run is bound by the
+            host's CPU/disk, not just network latency — set to 1 for the
+            old strictly-sequential behavior.
 
     Returns:
         List of DynamicTestResult objects
@@ -124,32 +228,19 @@ def run_dynamic_tests(
     if _prior_cost > 0 or _prior_input > 0 or _prior_output > 0:
         tracker.add_prior_usage(_prior_input, _prior_output, _prior_cost)
 
-    results: list[DynamicTestResult] = []
-
     total = len(findings)
     restored = len(successful_ids)
     remaining = total - restored
-    _completed = restored
-    _errors = 0
 
-    # Write initial summary so Go CLI can show accurate counts
-    checkpoint.ensure_dir()
-    checkpoint.write_summary(total, _completed, _errors, {}, phase="in_progress")
-
-    print(f"Dynamic testing {total} findings from {repo_info['name']} "
-          f"({restored} already done, {remaining} remaining)",
-          file=sys.stderr)
-
-    try:
-      for i, finding in enumerate(findings):
-        finding_id = finding.get("id", f"FINDING-{i+1}")
-
-        # Skip already-checkpointed findings, but ONLY if they succeeded.
-        # Errored findings fall through to fresh test generation + Docker run,
-        # so code/prompt fixes take effect on resume.
+    # Pre-populate results from checkpoints (restored, in original order);
+    # collect the rest as (index, finding, finding_id) work items.
+    results: list = [None] * total
+    to_process: list[tuple[int, dict, str]] = []
+    for i, finding in enumerate(findings):
+        finding_id = finding.get("id", f"FINDING-{i + 1}")
         cp_data = checkpointed.get(finding_id)
         if cp_data and cp_data.get("status") != "ERROR":
-            result = DynamicTestResult(
+            results[i] = DynamicTestResult(
                 finding_id=finding_id,
                 status=cp_data.get("status", "ERROR"),
                 details=cp_data.get("details", ""),
@@ -162,109 +253,69 @@ def run_dynamic_tests(
                 dockerfile=cp_data.get("dockerfile", ""),
                 docker_compose=cp_data.get("docker_compose", ""),
             )
-            results.append(result)
-            continue
+        else:
+            to_process.append((i, finding, finding_id))
 
-        print(f"\n[{i+1}/{total}] Testing {finding_id}: "
-              f"{finding.get('name', 'unknown')}...", file=sys.stderr)
+    _completed = restored
+    _errors = 0
+    _summary_lock = threading.Lock()
 
-        # Begin per-unit tracking so we can capture token counts for this
-        # finding in addition to cost.
-        tracker.start_unit_tracking()
+    # Write initial summary so Go CLI can show accurate counts
+    checkpoint.ensure_dir()
+    checkpoint.write_summary(total, _completed, _errors, {}, phase="in_progress")
 
-        # Step 1: Generate test
-        print("  Generating test...", file=sys.stderr)
-        generation = generate_test(finding, repo_info, dynamic_test_binding, tracker)
-        unit_usage = tracker.get_unit_usage()
-        generation_cost = unit_usage["cost_usd"]
+    print(f"Dynamic testing {total} findings from {repo_info['name']} "
+          f"({restored} already done, {remaining} remaining)",
+          file=sys.stderr)
 
-        if generation is None:
-            print("  Test generation failed.", file=sys.stderr)
-            result = collect_result(finding, None, None, generation_cost)
-            result.generation_input_tokens = unit_usage["input_tokens"]
-            result.generation_output_tokens = unit_usage["output_tokens"]
-            results.append(result)
-            if checkpoint:
-                checkpoint.save(finding_id, result.to_dict())
-            continue
-
-        print(f"  Generated (${generation_cost:.4f}). Running in Docker...",
-              file=sys.stderr)
-
-        # Resolve the vulnerable source file for pre-staging.
-        source_file = None
-        if repo_path:
-            rel_path = finding.get("location", {}).get("file", "")
-            if rel_path:
-                candidate = os.path.join(repo_path, rel_path)
-                if os.path.isfile(candidate):
-                    source_file = candidate
-
-        # Step 2: Execute in Docker and retry on errors
-        execution = run_single_container(generation, finding_id,
-                                         source_file=source_file)
-        result = collect_result(finding, generation, execution, generation_cost)
-        retry_count = 0
-
-        while result.status == "ERROR" and retry_count < max_retries:
-            # Extract error message: build error > stderr > application-level details
-            if execution.build_error:
-                error_msg = execution.build_error
-                error_type = "Build"
-            elif execution.exit_code != 0 and execution.stderr:
-                error_msg = execution.stderr
-                error_type = "Runtime"
-            else:
-                error_msg = result.details
-                error_type = "Application"
-
-            if execution.timed_out:
-                print(f"  Timed out — not retrying.", file=sys.stderr)
-                break
-
-            retry_count += 1
-            print(f"  {error_type} error. Retry {retry_count}/{max_retries} "
-                  f"with error feedback...", file=sys.stderr)
-
-            retry_gen = regenerate_test(
-                finding, repo_info, generation,
-                error_msg, dynamic_test_binding, tracker,
-            )
-            # Refresh unit usage after retry (tracker accumulates across calls
-            # on the same thread).
-            unit_usage = tracker.get_unit_usage()
-            generation_cost = unit_usage["cost_usd"]
-
-            if retry_gen is None:
-                print(f"  Retry generation failed.", file=sys.stderr)
-                break
-
-            generation = retry_gen
-            execution = run_single_container(generation, finding_id,
-                                             source_file=source_file)
-            result = collect_result(finding, generation, execution, generation_cost)
-            print(f"  Retry {retry_count} result: {result.status} "
-                  f"(${generation_cost:.4f})", file=sys.stderr)
-
-        result.retry_count = retry_count
-        result.generation_input_tokens = unit_usage["input_tokens"]
-        result.generation_output_tokens = unit_usage["output_tokens"]
-        results.append(result)
-
-        # Save checkpoint and update summary after each finding
-        if checkpoint:
+    def _record(index: int, finding_id: str, result: DynamicTestResult) -> None:
+        """Store a finished finding's result, save its checkpoint, and
+        update/publish the running summary. Safe to call from any worker
+        thread — the only shared mutable state (_completed/_errors) is
+        guarded by _summary_lock."""
+        nonlocal _completed, _errors
+        results[index] = result
+        with _summary_lock:
             checkpoint.save(finding_id, result.to_dict())
             _completed += 1
             if result.status == "ERROR":
                 _errors += 1
             checkpoint.write_summary(total, _completed, _errors, {}, phase="in_progress")
 
-        print(f"  Result: {result.status} ({result.elapsed_seconds:.1f}s)",
-              file=sys.stderr)
+    try:
+        if workers <= 1:
+            for i, finding, finding_id in to_process:
+                result = _process_one_finding(
+                    i, total, finding, finding_id, repo_info, repo_path,
+                    dynamic_test_binding, tracker, max_retries,
+                )
+                _record(i, finding_id, result)
+        else:
+            executor = ThreadPoolExecutor(max_workers=workers)
+            futures = {
+                executor.submit(
+                    _process_one_finding,
+                    i, total, finding, finding_id, repo_info, repo_path,
+                    dynamic_test_binding, tracker, max_retries,
+                ): (i, finding_id)
+                for i, finding, finding_id in to_process
+            }
+            try:
+                for future in as_completed(futures):
+                    i, finding_id = futures[future]
+                    _record(i, finding_id, future.result())
+            except KeyboardInterrupt:
+                print("\n[Dynamic Test] Interrupted — cancelling pending work...",
+                      file=sys.stderr, flush=True)
+                executor.shutdown(wait=False, cancel_futures=True)
+                print("[Dynamic Test] Progress saved to checkpoints",
+                      file=sys.stderr, flush=True)
+                return [r for r in results if r is not None]
+            executor.shutdown(wait=False)
     except KeyboardInterrupt:
         print("\n[Dynamic Test] Interrupted — progress saved to checkpoints",
               file=sys.stderr, flush=True)
-        return results
+        return [r for r in results if r is not None]
 
     # Generate report
     total_cost = tracker.total_cost_usd
@@ -288,7 +339,6 @@ def run_dynamic_tests(
 
     # Mark done. Checkpoints are preserved as a permanent artifact alongside
     # results — allows retroactive retry of errored findings after fixes.
-    if checkpoint:
-        checkpoint.write_summary(total, _completed, _errors, {}, phase="done")
+    checkpoint.write_summary(total, _completed, _errors, {}, phase="done")
 
     return results

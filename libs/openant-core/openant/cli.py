@@ -432,6 +432,7 @@ def cmd_dynamic_test(args):
                 max_retries=args.max_retries,
                 repo_path=getattr(args, "repo_path", None),
                 llm_config_name=args.llm_config,
+                workers=args.workers,
             )
 
             ctx.summary = {
@@ -1181,6 +1182,9 @@ def main():
     dt_p.add_argument("--repo-path", help="Path to the repository root (for pre-staging source files into Docker build context)")
     dt_p.add_argument("--max-retries", type=int, default=3,
                       help="Max retries per finding on error (default: 3)")
+    dt_p.add_argument("--workers", type=int, default=4,
+                      help="Findings tested in parallel (default: 4; each gets its own "
+                           "Docker image/network so concurrent runs don't collide)")
     dt_p.add_argument(
         "--llm-config",
         default=None,

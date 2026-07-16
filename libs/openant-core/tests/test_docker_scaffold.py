@@ -235,6 +235,114 @@ def test_orchestrator_works_without_repo_path(tmp_path, monkeypatch):
 # Link 4 + prompt: existing tests
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Parallel execution (workers > 1)
+# ---------------------------------------------------------------------------
+
+
+def _multi_finding_pipeline_output(n: int) -> dict:
+    return {
+        "repository": {"name": "test", "language": "python"},
+        "application_type": "web_app",
+        "findings": [
+            {
+                "id": f"VULN-{i:03d}",
+                "name": f"test vuln {i}",
+                "short_name": "vuln",
+                "location": {"file": "app.py", "function": "app.py:vuln"},
+                "cwe_id": 79,
+                "cwe_name": "XSS",
+                "stage1_verdict": "vulnerable",
+                "stage2_verdict": "confirmed",
+            }
+            for i in range(n)
+        ],
+    }
+
+
+def _install_ok_mocks(monkeypatch, seen_finding_ids):
+    """Mock generate_test/run_single_container to succeed and record which
+    finding_id each call was for, thread-safely (list.append is atomic
+    under the GIL)."""
+
+    def mock_generate_test(finding, repo_info, binding, tracker):
+        return {
+            "dockerfile": "FROM python:3.11\nCMD echo hi",
+            "test_script": "print('ok')",
+            "test_filename": "test_exploit.py",
+        }
+
+    def mock_run_single_container(generation, finding_id, source_file=None, **kwargs):
+        seen_finding_ids.append(finding_id)
+        from utilities.dynamic_tester.docker_executor import DockerExecutionResult
+        result = DockerExecutionResult()
+        result.stdout = '{"status": "CONFIRMED", "details": "test", "evidence": []}'
+        result.exit_code = 0
+        return result
+
+    monkeypatch.setattr("utilities.dynamic_tester.generate_test", mock_generate_test)
+    monkeypatch.setattr("utilities.dynamic_tester.run_single_container", mock_run_single_container)
+
+
+def test_parallel_workers_process_every_finding_exactly_once(tmp_path, monkeypatch):
+    """workers>1 must still test every finding exactly once, with results
+    in the same order as the input findings list."""
+    import json
+
+    n = 6
+    po = _multi_finding_pipeline_output(n)
+    po_path = tmp_path / "pipeline_output.json"
+    po_path.write_text(json.dumps(po))
+
+    seen = []
+    _install_ok_mocks(monkeypatch, seen)
+
+    from utilities.dynamic_tester import run_dynamic_tests
+    results = run_dynamic_tests(
+        pipeline_output_path=str(po_path),
+        output_dir=str(tmp_path / "out"),
+        max_retries=0,
+        registry=_fake_registry(),
+        workers=4,
+    )
+
+    assert len(results) == n
+    assert [r.finding_id for r in results] == [f"VULN-{i:03d}" for i in range(n)], (
+        "results must preserve input order even when processed concurrently"
+    )
+    assert sorted(seen) == sorted(f"VULN-{i:03d}" for i in range(n)), (
+        "every finding must be tested exactly once"
+    )
+    assert all(r.status == "CONFIRMED" for r in results)
+
+
+def test_workers_one_matches_parallel_results(tmp_path, monkeypatch):
+    """workers=1 (sequential) and workers>1 (parallel) must produce the
+    same set of results for the same input — parallelism is an
+    implementation detail, not an observable behavior change."""
+    import json
+
+    n = 4
+    po = _multi_finding_pipeline_output(n)
+    po_path = tmp_path / "pipeline_output.json"
+    po_path.write_text(json.dumps(po))
+
+    seen = []
+    _install_ok_mocks(monkeypatch, seen)
+
+    from utilities.dynamic_tester import run_dynamic_tests
+    results = run_dynamic_tests(
+        pipeline_output_path=str(po_path),
+        output_dir=str(tmp_path / "out"),
+        max_retries=0,
+        registry=_fake_registry(),
+        workers=1,
+    )
+
+    assert [r.finding_id for r in results] == [f"VULN-{i:03d}" for i in range(n)]
+    assert all(r.status == "CONFIRMED" for r in results)
+
+
 def test_finding_prompt_includes_source_basename():
     """_build_finding_prompt must tell the LLM the staged filename."""
     from utilities.dynamic_tester.test_generator import _build_finding_prompt

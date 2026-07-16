@@ -89,6 +89,11 @@ class _FakeResultMessage:
         self.subtype = subtype
 
 
+class _FakeRateLimitEvent:
+    def __init__(self, rate_limit_info):
+        self.rate_limit_info = rate_limit_info
+
+
 @pytest.fixture(autouse=True)
 def _stub_claude_agent_sdk_module(monkeypatch):
     """Make ``import claude_agent_sdk`` succeed inside the constructor
@@ -105,6 +110,7 @@ def _stub_claude_agent_sdk_module(monkeypatch):
     fake_mod.ThinkingBlock = _FakeThinkingBlock
     fake_mod.AssistantMessage = _FakeAssistantMessage
     fake_mod.ResultMessage = _FakeResultMessage
+    fake_mod.RateLimitEvent = _FakeRateLimitEvent
     fake_mod.ClaudeAgentOptions = lambda **kwargs: SimpleNamespace(**kwargs)
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake_mod)
     return fake_mod

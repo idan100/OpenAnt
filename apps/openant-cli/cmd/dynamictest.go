@@ -29,12 +29,14 @@ var (
 	dynamicTestOutput     string
 	dynamicTestMaxRetries int
 	dynamicTestLLMConfig  string
+	dynamicTestWorkers    int
 )
 
 func init() {
 	dynamicTestCmd.Flags().StringVarP(&dynamicTestOutput, "output", "o", "", "Output directory")
 	dynamicTestCmd.Flags().IntVar(&dynamicTestMaxRetries, "max-retries", 3, "Max retries per finding on error")
 	dynamicTestCmd.Flags().StringVar(&dynamicTestLLMConfig, "llm-config", "", "Name of the llm-config in ~/.config/openant/config.json (defaults to the file's default_llm, or the built-in 'openant-default' if no config file exists).")
+	dynamicTestCmd.Flags().IntVar(&dynamicTestWorkers, "workers", 4, "Findings tested in parallel; each gets its own Docker image/network so concurrent runs don't collide")
 }
 
 func runDynamicTest(cmd *cobra.Command, args []string) {
@@ -89,6 +91,9 @@ func runDynamicTest(cmd *cobra.Command, args []string) {
 	}
 	if dynamicTestLLMConfig != "" {
 		pyArgs = append(pyArgs, "--llm-config", dynamicTestLLMConfig)
+	}
+	if dynamicTestWorkers != 4 {
+		pyArgs = append(pyArgs, "--workers", fmt.Sprintf("%d", dynamicTestWorkers))
 	}
 
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())

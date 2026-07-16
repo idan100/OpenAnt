@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import threading
 from typing import Any, Optional
@@ -161,6 +162,30 @@ def _warn_unknown_block_kind(kind: str) -> None:
             f"warning: ClaudeSubscriptionAdapter received unknown content "
             f"block kind {kind!r}; dropping it.\n"
         )
+
+
+# Cross-process usage visibility: this adapter runs inside a subprocess
+# spawned by an external orchestrator (e.g. AutoScan's openant_runner.py),
+# which has no in-process access to the SDK's RateLimitEvent stream. If the
+# caller points OPENANT_RATE_LIMIT_STATUS_FILE at a path, the latest
+# RateLimitInfo (incl. `utilization`, 0.0-1.0) is mirrored there on every
+# transition so the caller can poll it and stop a long scan before the
+# subscription's hard cap hits mid-request. No-op (default) when unset --
+# zero behavior change for any caller that doesn't opt in.
+def _persist_rate_limit_status(info) -> None:
+    path = os.environ.get("OPENANT_RATE_LIMIT_STATUS_FILE")
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({
+                "status": info.status,
+                "utilization": info.utilization,
+                "rate_limit_type": info.rate_limit_type,
+                "resets_at": info.resets_at,
+            }, f)
+    except OSError:
+        pass  # best-effort telemetry; never let this break the actual scan
 
 
 class _ZeroCostPricing(dict):
@@ -376,7 +401,7 @@ async def _run_query(
     tool_bridge,
     max_turns: int,
 ):
-    from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, query
+    from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, RateLimitEvent, ResultMessage, query
 
     mcp_servers: dict[str, Any] = {}
     tools_allowlist: list[str] = []
@@ -429,6 +454,8 @@ async def _run_query(
                     first_assistant = message
             elif isinstance(message, ResultMessage):
                 last_result = message
+            elif isinstance(message, RateLimitEvent):
+                _persist_rate_limit_status(message.rate_limit_info)
     except Exception:
         # The SDK can raise mid-stream even after already giving us a
         # decisive message — observed live: an AssistantMessage with

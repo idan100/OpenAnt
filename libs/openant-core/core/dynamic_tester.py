@@ -22,6 +22,7 @@ def run_tests(
     repo_path: str | None = None,
     registry=None,
     llm_config_name: str | None = None,
+    workers: int = 4,
 ) -> DynamicTestStepResult:
     """Run dynamic exploit tests on confirmed vulnerabilities.
 
@@ -34,6 +35,9 @@ def run_tests(
         registry: Pre-built PhaseRegistry passed down by the scanner.
             Standalone callers omit this and pay one config-load.
         llm_config_name: Name of the llm-config when registry is None.
+        workers: Findings tested in parallel (default 4). See
+            ``utilities.dynamic_tester.run_dynamic_tests`` for why this
+            defaults lower than the 8 used for the API-only phases.
 
     Returns:
         DynamicTestStepResult with counts and paths.
@@ -100,6 +104,7 @@ def run_tests(
         repo_path=repo_path,
         registry=registry,
         llm_config_name=llm_config_name,
+        workers=workers,
     )
 
     # Count outcomes

@@ -626,6 +626,7 @@ def scan_repository(
                         pipeline_output_path=pipeline_output_path,
                         output_dir=output_dir,
                         registry=registry,
+                        workers=workers,
                     )
 
                     ctx.summary = {

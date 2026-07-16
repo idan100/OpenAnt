@@ -25,12 +25,19 @@ def main():
         default=3,
         help="Maximum retries per finding on ERROR status (default: 3)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Findings tested in parallel (default: 4)",
+    )
 
     args = parser.parse_args()
 
     results = run_dynamic_tests(
         args.pipeline_output, args.output_dir,
         max_retries=args.max_retries,
+        workers=args.workers,
     )
 
     # Print summary
