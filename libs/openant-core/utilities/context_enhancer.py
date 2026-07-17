@@ -56,7 +56,7 @@ _null_logger.addHandler(logging.NullHandler())
 
 # The enhance phase's model is supplied by the binding now; this
 # constant is retained only for legacy log lines that reference it.
-CONTEXT_ENHANCEMENT_MODEL_LEGACY = "claude-sonnet-4-20250514"
+CONTEXT_ENHANCEMENT_MODEL_LEGACY = "claude-sonnet-5"
 
 # Max bounded rounds of the post-loop transient-error retry. Each round
 # re-attempts units still carrying a retryable error; rounds stop early once

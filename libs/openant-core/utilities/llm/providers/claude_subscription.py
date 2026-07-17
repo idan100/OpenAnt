@@ -62,6 +62,38 @@ Read this before touching the file:
    otherwise spend chatting with Claude. It's not "free" in the sense
    of having no cost, just not separately *billed*.
 
+5. **No client-controllable prompt caching, but some happens anyway.**
+   ``ClaudeAgentOptions`` has no ``cache_control`` equivalent — verified
+   against the installed SDK, not assumed. Every ``complete()`` call is a
+   fresh CLI session (point 2 above). Live-tested against a real
+   authenticated CLI (2026-07): the fixed system-prompt/tooling prefix
+   IS cached server-side and reused across separate, unrelated sessions
+   (a 20k+ token cache read on a call with no prior history at all) —
+   that part is free and automatic, no code needed. What does NOT
+   benefit: the growing per-unit tool-loop conversation. Also tested —
+   ``resume``/``session_id`` genuinely thread conversation state
+   correctly across separate ``complete()`` calls (no cross-session
+   leakage), but a resumed call pays full cache-*write* price again
+   rather than a cheap cache-*read*, so it was NOT wired in: real
+   complexity (thread-safe session tracking across parallel workers,
+   with a session-mismatch bug risking one unit's context leaking into
+   another's security verdict) for no measured token benefit.
+
+   The lever that IS wired in: ``effort`` (defaults to ``"high"`` —
+   maximum reasoning depth — when never set). Rather than a fixed
+   value, effort is decided dynamically per call from the most recent
+   ``RateLimitEvent.rate_limit_info.utilization`` this process has
+   observed (0.0-1.0; see ``_UtilizationTracker`` /
+   ``_dynamic_effort_for_utilization``) — comfortably low usage keeps
+   ``"high"``, and effort steps down toward ``"low"`` as the scan's
+   actual observed usage climbs toward the subscription's cap. Set
+   ``OPENANT_CLAUDE_SUBSCRIPTION_EFFORT=low|medium|high|xhigh|max`` to
+   pin a fixed value instead and skip the dynamic selection entirely.
+   Deliberately NOT a ``config.json``/``ProviderConfig`` field: this
+   setting is meaningful only to this one adapter, and every other
+   provider config knob (``api_key``, ``base_url``) is shared schema —
+   an env var avoids growing that schema for a single-adapter concern.
+
 See ``utilities/llm/adapter.py`` for the protocol every adapter
 implements, and ``providers/anthropic.py`` for the reference metered
 adapter this one deliberately departs from.
@@ -144,6 +176,15 @@ _ERROR_MESSAGES = {
     ),
 }
 
+# Valid values for ClaudeAgentOptions.effort per the installed SDK's
+# docstring (utilities.llm.providers.claude_subscription module docstring
+# point 5). "xhigh" is accepted here even though the SDK falls it back to
+# "high" on non-Opus-4.7 models — that's the SDK's business, not ours to
+# second-guess.
+_VALID_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_EFFORT_ENV_VAR = "OPENANT_CLAUDE_SUBSCRIPTION_EFFORT"
+
+
 # One-time-per-process warning bookkeeping for content-block kinds we
 # receive but don't translate (mirrors AnthropicAdapter's pattern in
 # providers/anthropic.py).
@@ -162,6 +203,16 @@ def _warn_unknown_block_kind(kind: str) -> None:
             f"warning: ClaudeSubscriptionAdapter received unknown content "
             f"block kind {kind!r}; dropping it.\n"
         )
+
+
+def reset_warnings() -> None:
+    """Clear this adapter's one-time-warning memory AND the dynamic-effort
+    utilization tracker (for tests / a fresh scan). Mirrors
+    ``providers/anthropic.py``'s ``reset_warnings`` — picked up by
+    ``utilities/llm_client.py``'s ``reset_warning_state()``."""
+    with _warned_block_kinds_lock:
+        _warned_block_kinds.clear()
+    _UtilizationTracker.reset()
 
 
 # Cross-process usage visibility: this adapter runs inside a subprocess
@@ -186,6 +237,55 @@ def _persist_rate_limit_status(info) -> None:
             }, f)
     except OSError:
         pass  # best-effort telemetry; never let this break the actual scan
+
+
+# Process-global, thread-safe tracker of the most recently observed
+# subscription-usage utilization (0.0-1.0), fed by every RateLimitEvent
+# any worker sees during any call (see the RateLimitEvent branch in
+# _run_query). This is what makes effort "dynamically decided by the
+# running project" (point 5 in the module docstring) instead of a
+# static guess: as THIS scan's actual observed usage climbs toward the
+# subscription's cap, effort steps down on subsequent calls to conserve
+# what's left. Deliberately process-global rather than per-adapter-
+# instance: every phase's adapter shares the same underlying
+# subscription cap, so a signal observed by e.g. the verify phase should
+# also throttle the enhance phase's next call.
+class _UtilizationTracker:
+    _lock = threading.Lock()
+    _utilization: float | None = None
+
+    @classmethod
+    def update(cls, utilization: float | None) -> None:
+        if utilization is None:
+            return
+        with cls._lock:
+            cls._utilization = utilization
+
+    @classmethod
+    def current(cls) -> float | None:
+        with cls._lock:
+            return cls._utilization
+
+    @classmethod
+    def reset(cls) -> None:
+        """Clear tracked state. For tests / a fresh scan process."""
+        with cls._lock:
+            cls._utilization = None
+
+
+# Utilization -> effort thresholds. None means "no signal yet, or
+# comfortably low" -> defer to the SDK's own default ("high"). Effort
+# steps down as observed usage climbs toward the cap, trading reasoning
+# depth for a better chance of finishing the scan before hitting it.
+# Chosen conservatively (step down starts at 50% observed utilization)
+# since dropping effort late, after the cap is already close, gives the
+# remaining calls in flight less room to actually conserve anything.
+def _dynamic_effort_for_utilization(utilization: float | None) -> str | None:
+    if utilization is None or utilization < 0.5:
+        return None
+    if utilization < 0.75:
+        return "medium"
+    return "low"
 
 
 class _ZeroCostPricing(dict):
@@ -229,6 +329,19 @@ class ClaudeSubscriptionAdapter:
                 "authenticate with your Claude Pro/Max subscription."
             ) from exc
 
+        # Explicit pin, overriding the dynamic utilization-based selection
+        # below (see module docstring point 5). Unset (the default) means
+        # effort is decided dynamically per-call instead of a fixed value.
+        effort_override = os.environ.get(_EFFORT_ENV_VAR)
+        if effort_override is not None and effort_override not in _VALID_EFFORT_LEVELS:
+            raise ValueError(
+                f"{_EFFORT_ENV_VAR}={effort_override!r} is not a valid effort "
+                f"level; use one of {sorted(_VALID_EFFORT_LEVELS)}, or unset "
+                f"it to let effort be decided dynamically from observed "
+                f"subscription usage instead."
+            )
+        self._effort_override = effort_override
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -256,6 +369,15 @@ class ClaudeSubscriptionAdapter:
         # the SDK before it starts that 2nd turn at all.
         max_turns = 1
 
+        # Explicit env-var pin wins outright. Otherwise, decide fresh on
+        # every call from the most recently observed subscription
+        # utilization (module docstring point 5) — not a value fixed at
+        # adapter construction, since utilization changes as the scan
+        # progresses and this call may be minutes/hours after the last one.
+        effort = self._effort_override
+        if effort is None:
+            effort = _dynamic_effort_for_utilization(_UtilizationTracker.current())
+
         try:
             first_assistant, last_result = asyncio.run(
                 _run_query(
@@ -264,6 +386,7 @@ class ClaudeSubscriptionAdapter:
                     system_prompt=system_prompt,
                     tool_bridge=tool_bridge,
                     max_turns=max_turns,
+                    effort=effort,
                 )
             )
         except LLMError:
@@ -400,6 +523,7 @@ async def _run_query(
     system_prompt: str,
     tool_bridge,
     max_turns: int,
+    effort: str | None = None,
 ):
     from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, RateLimitEvent, ResultMessage, query
 
@@ -427,6 +551,10 @@ async def _run_query(
         permission_mode="bypassPermissions",
         mcp_servers=mcp_servers,
         max_turns=max_turns,
+        # None preserves the SDK's own default ("high") — see module
+        # docstring point 5 and the OPENANT_CLAUDE_SUBSCRIPTION_EFFORT
+        # env var read in the constructor.
+        effort=effort,
         # Load NONE of the user's personal ~/.claude / project settings
         # (hooks, plugins, slash commands). Without this, the subprocess
         # inherits whatever the human has installed for their own
@@ -456,6 +584,9 @@ async def _run_query(
                 last_result = message
             elif isinstance(message, RateLimitEvent):
                 _persist_rate_limit_status(message.rate_limit_info)
+                _UtilizationTracker.update(
+                    getattr(message.rate_limit_info, "utilization", None)
+                )
     except Exception:
         # The SDK can raise mid-stream even after already giving us a
         # decisive message — observed live: an AssistantMessage with
@@ -550,6 +681,16 @@ def _translate(first_assistant, last_result) -> CompletionResult:
         content=content_blocks,
         input_tokens=usage.get("input_tokens", 0),
         output_tokens=usage.get("output_tokens", 0),
+        # The SDK's usage dict carries these even though nothing in this
+        # adapter requests caching explicitly — confirmed live (2026-07)
+        # against a real session: Claude Code's own system-prompt/tooling
+        # prefix is cached and reused automatically across separate,
+        # unrelated sessions. Reading them through (previously dropped,
+        # always reporting 0) is what makes that visible in
+        # TokenTracker's cache_hit_rate/cache_savings_usd instead of
+        # silently under-counting real cache activity on this provider.
+        cache_creation_input_tokens=usage.get("cache_creation_input_tokens", 0) or 0,
+        cache_read_input_tokens=usage.get("cache_read_input_tokens", 0) or 0,
         stop_reason=stop_reason,
         raw=first_assistant,
     )

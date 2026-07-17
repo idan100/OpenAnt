@@ -40,70 +40,70 @@ var setupLLMPhases = []phaseSpec{
 		name:  "app_context",
 		short: "Application-context classification (runs first in scan).",
 		defaultModels: map[string]string{
-			"anthropic":           "claude-sonnet-4-20250514",
+			"anthropic":           "claude-sonnet-5",
 			"openai":              "gpt-4o-mini",
 			"google":              "gemini-2.0-flash",
-			"claude_subscription": "claude-sonnet-4-20250514",
+			"claude_subscription": "claude-sonnet-5",
 		},
 	},
 	{
 		name:  "llm_reach",
 		short: "LLM-driven reachability review (opt-in stage).",
 		defaultModels: map[string]string{
-			"anthropic":           "claude-opus-4-6",
+			"anthropic":           "claude-sonnet-5",
 			"openai":              "gpt-4o",
 			"google":              "gemini-1.5-pro",
-			"claude_subscription": "claude-opus-4-6",
+			"claude_subscription": "claude-sonnet-5",
 		},
 	},
 	{
 		name:  "enhance",
 		short: "Context enhancement (single-shot + agentic tool calling).",
 		defaultModels: map[string]string{
-			"anthropic":           "claude-sonnet-4-20250514",
+			"anthropic":           "claude-sonnet-5",
 			"openai":              "gpt-4o-mini",
 			"google":              "gemini-2.0-flash",
-			"claude_subscription": "claude-sonnet-4-20250514",
+			"claude_subscription": "claude-sonnet-5",
 		},
 	},
 	{
 		name:  "analyze",
 		short: "Stage 1 vulnerability detection.",
 		defaultModels: map[string]string{
-			"anthropic":           "claude-opus-4-6",
+			"anthropic":           "claude-sonnet-5",
 			"openai":              "gpt-4o",
 			"google":              "gemini-1.5-pro",
-			"claude_subscription": "claude-opus-4-6",
+			"claude_subscription": "claude-sonnet-5",
 		},
 	},
 	{
 		name:  "verify",
 		short: "Stage 2 attacker simulation (tool calling).",
 		defaultModels: map[string]string{
-			"anthropic":           "claude-opus-4-6",
+			"anthropic":           "claude-sonnet-5",
 			"openai":              "gpt-4o",
 			"google":              "gemini-1.5-pro",
-			"claude_subscription": "claude-opus-4-6",
+			"claude_subscription": "claude-sonnet-5",
 		},
 	},
 	{
 		name:  "dynamic_test",
 		short: "Docker exploit-test generation.",
 		defaultModels: map[string]string{
-			"anthropic":           "claude-sonnet-4-20250514",
+			"anthropic":           "claude-sonnet-5",
 			"openai":              "gpt-4o-mini",
 			"google":              "gemini-2.0-flash",
-			"claude_subscription": "claude-sonnet-4-20250514",
+			"claude_subscription": "claude-sonnet-5",
 		},
 	},
 	{
 		name:  "report",
 		short: "Disclosure + summary + remediation generation.",
 		defaultModels: map[string]string{
-			"anthropic":           "claude-sonnet-4-20250514",
+			"anthropic":           "claude-sonnet-5",
 			"openai":              "gpt-4o-mini",
 			"google":              "gemini-2.0-flash",
-			"claude_subscription": "claude-sonnet-4-20250514",
+			"claude_subscription": "claude-sonnet-5",
 		},
 	},
 }
@@ -117,6 +117,7 @@ var setupLLMPhases = []phaseSpec{
 // provider's docs and type the exact ID at the prompt.
 var knownModels = map[string][]string{
 	"anthropic": {
+		"claude-sonnet-5",
 		"claude-opus-4-6",
 		"claude-opus-4-20250514",
 		"claude-sonnet-4-20250514",
@@ -138,6 +139,7 @@ var knownModels = map[string][]string{
 	// models, just authenticated via a local `claude login` session
 	// (Claude Pro/Max) instead of an api.anthropic.com API key.
 	"claude_subscription": {
+		"claude-sonnet-5",
 		"claude-opus-4-6",
 		"claude-opus-4-20250514",
 		"claude-sonnet-4-20250514",

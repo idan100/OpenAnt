@@ -36,25 +36,15 @@ _ANTHROPIC_PROVIDER = "anthropic"
 OPENANT_DEFAULT = LLMConfig(
     name="openant-default",
     phases={
-        # Stage 1 detection. Opus by historical default.
-        "analyze": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-opus-4-6"),
-        # Context enhancement (agentic + single-shot). Sonnet for cost.
-        "enhance": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-4-20250514"),
-        # Stage 2 attacker simulation. Opus, uses tool calling.
-        "verify": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-opus-4-6"),
-        # Disclosure + summary + remediation HTML generation. Opus —
-        # matches master's report/generator.py (MODEL="claude-opus-4-6").
-        # The refactor briefly moved this to Sonnet; restored so the
-        # report output (incl. the HTML-remediation sub-call) stays on
-        # Opus on a fresh, config-less install.
-        "report": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-opus-4-6"),
-        # Docker exploit-test generation. Sonnet.
-        "dynamic_test": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-4-20250514"),
-        # LLM-driven reachability review (opt-in stage). Opus.
-        "llm_reach": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-opus-4-6"),
-        # Application-context classification (web_app / cli_tool / etc).
-        # Single-shot, runs once per scan during ``openant scan``. Sonnet.
-        "app_context": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-4-20250514"),
+        # Every phase pinned to Sonnet 5 — single-model default per
+        # explicit project decision (no per-phase Opus/Sonnet split).
+        "analyze": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-5"),
+        "enhance": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-5"),
+        "verify": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-5"),
+        "report": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-5"),
+        "dynamic_test": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-5"),
+        "llm_reach": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-5"),
+        "app_context": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-5"),
     },
 )
 

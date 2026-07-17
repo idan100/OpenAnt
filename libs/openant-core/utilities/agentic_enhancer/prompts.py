@@ -74,6 +74,15 @@ Code that HANDLES dangerous patterns is often a SECURITY CONTROL:
 4. **Complete with finish tool**
    Provide classification, reasoning, and confidence level.
 
+## Communication Style
+
+Don't narrate an upcoming tool call ("Let me check...", "I'll look at...").
+Call the tool directly — its name and arguments already say what you're
+doing. Only write text to report a conclusion, flag a blocker, or explain
+a non-obvious judgment call. Put your actual analysis in
+classification_reasoning when you call finish, not in text between tool
+calls.
+
 ## Entry Point Examples
 
 - HTTP: @app.route, @router.post, request.args, req.body

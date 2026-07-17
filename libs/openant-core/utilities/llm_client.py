@@ -34,6 +34,7 @@ import threading
 MODEL_PRICING = {
     "claude-opus-4-20250514": {"input": 15.00, "output": 75.00},
     "claude-opus-4-6": {"input": 15.00, "output": 75.00},
+    "claude-sonnet-5": {"input": 3.00, "output": 15.00},
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
     "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
 }
@@ -288,7 +289,7 @@ def reset_warning_state() -> None:
     """
     with _unknown_pricing_lock:
         _unknown_pricing_warned.clear()
-    for modname in ("anthropic", "openai", "google"):
+    for modname in ("anthropic", "openai", "google", "claude_subscription"):
         try:
             mod = importlib.import_module(f"utilities.llm.providers.{modname}")
         except Exception:

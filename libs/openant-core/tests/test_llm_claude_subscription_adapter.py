@@ -123,6 +123,13 @@ def _reset_rate_limiter():
     reset_rate_limiter()
 
 
+@pytest.fixture(autouse=True)
+def _reset_utilization_tracker():
+    mod._UtilizationTracker.reset()
+    yield
+    mod._UtilizationTracker.reset()
+
+
 def _assistant(content, *, usage=None, error=None, retry_after_seconds=None):
     return SimpleNamespace(
         content=content,
@@ -156,7 +163,7 @@ def _stub_run_query(monkeypatch, handler):
     scenario needs to touch the real MCP-tool wiring.
     """
 
-    async def fake_run_query(*, model, prompt, system_prompt, tool_bridge, max_turns):
+    async def fake_run_query(*, model, prompt, system_prompt, tool_bridge, max_turns, effort=None):
         return handler(prompt, tool_bridge)
 
     monkeypatch.setattr(mod, "_run_query", fake_run_query)
@@ -197,6 +204,166 @@ class TestConstructor:
 
 
 # ---------------------------------------------------------------------------
+# Effort configuration (OPENANT_CLAUDE_SUBSCRIPTION_EFFORT)
+# ---------------------------------------------------------------------------
+
+
+class TestEffortConfiguration:
+    def test_unset_env_var_means_no_override(self, monkeypatch):
+        monkeypatch.delenv("OPENANT_CLAUDE_SUBSCRIPTION_EFFORT", raising=False)
+        adapter = mod.ClaudeSubscriptionAdapter()
+        assert adapter._effort_override is None
+
+    def test_valid_env_var_is_read(self, monkeypatch):
+        monkeypatch.setenv("OPENANT_CLAUDE_SUBSCRIPTION_EFFORT", "medium")
+        adapter = mod.ClaudeSubscriptionAdapter()
+        assert adapter._effort_override == "medium"
+
+    def test_invalid_env_var_raises_clear_error(self, monkeypatch):
+        monkeypatch.setenv("OPENANT_CLAUDE_SUBSCRIPTION_EFFORT", "ludicrous")
+        with pytest.raises(ValueError, match="ludicrous"):
+            mod.ClaudeSubscriptionAdapter()
+
+    def test_override_reaches_claude_agent_options(self, monkeypatch, _stub_claude_agent_sdk_module):
+        """End-to-end: the env var override must actually reach the SDK's
+        options object, not just get stored on the adapter."""
+        monkeypatch.setenv("OPENANT_CLAUDE_SUBSCRIPTION_EFFORT", "low")
+        sdk = _stub_claude_agent_sdk_module
+        captured = {}
+
+        async def fake_query(*, prompt, options):
+            captured["effort"] = options.effort
+            yield _FakeAssistantMessage(content=[_FakeTextBlock("hi")])
+            yield _FakeResultMessage()
+
+        sdk.query = fake_query
+
+        adapter = mod.ClaudeSubscriptionAdapter()
+        adapter.complete(
+            model="claude-opus-4-6",
+            system=None,
+            messages=[Message(role="user", content=[TextBlock("hi")])],
+            max_tokens=8,
+        )
+
+        assert captured["effort"] == "low"
+
+    def test_no_signal_yet_reaches_options_as_none(self, monkeypatch, _stub_claude_agent_sdk_module):
+        """No env var override and no observed RateLimitEvent yet: must
+        reach the SDK as None (defer to its own "high" default) — not
+        omitted, not a stale value from a prior test."""
+        monkeypatch.delenv("OPENANT_CLAUDE_SUBSCRIPTION_EFFORT", raising=False)
+        sdk = _stub_claude_agent_sdk_module
+        captured = {}
+
+        async def fake_query(*, prompt, options):
+            captured["effort"] = options.effort
+            yield _FakeAssistantMessage(content=[_FakeTextBlock("hi")])
+            yield _FakeResultMessage()
+
+        sdk.query = fake_query
+
+        adapter = mod.ClaudeSubscriptionAdapter()
+        adapter.complete(
+            model="claude-opus-4-6",
+            system=None,
+            messages=[Message(role="user", content=[TextBlock("hi")])],
+            max_tokens=8,
+        )
+
+        assert captured["effort"] is None
+
+
+class TestDynamicEffortFromUtilization:
+    """Effort is decided per-call from the most recently observed
+    RateLimitEvent.rate_limit_info.utilization — not a static setting."""
+
+    @pytest.mark.parametrize(
+        "utilization,expected",
+        [
+            (None, None),
+            (0.0, None),
+            (0.49, None),
+            (0.5, "medium"),
+            (0.74, "medium"),
+            (0.75, "low"),
+            (0.99, "low"),
+        ],
+    )
+    def test_mapping_thresholds(self, utilization, expected):
+        assert mod._dynamic_effort_for_utilization(utilization) == expected
+
+    def test_observed_rate_limit_event_lowers_effort_on_next_call(
+        self, monkeypatch, _stub_claude_agent_sdk_module
+    ):
+        monkeypatch.delenv("OPENANT_CLAUDE_SUBSCRIPTION_EFFORT", raising=False)
+        sdk = _stub_claude_agent_sdk_module
+        captured = []
+
+        async def fake_query(*, prompt, options):
+            captured.append(options.effort)
+            # First call: emit a high-utilization RateLimitEvent alongside
+            # the answer, simulating the subscription reporting stress.
+            if len(captured) == 1:
+                yield _FakeRateLimitEvent(SimpleNamespace(
+                    status="approaching_limit", utilization=0.8,
+                    rate_limit_type="five_hour", resets_at=None,
+                ))
+            yield _FakeAssistantMessage(content=[_FakeTextBlock("hi")])
+            yield _FakeResultMessage()
+
+        sdk.query = fake_query
+        adapter = mod.ClaudeSubscriptionAdapter()
+
+        # First call: no signal observed yet -> None (SDK default).
+        adapter.complete(
+            model="claude-opus-4-6", system=None,
+            messages=[Message(role="user", content=[TextBlock("hi")])],
+            max_tokens=8,
+        )
+        assert captured[0] is None
+
+        # Second call: the RateLimitEvent from call 1 (utilization=0.8)
+        # must have lowered this call's effort to "low".
+        adapter.complete(
+            model="claude-opus-4-6", system=None,
+            messages=[Message(role="user", content=[TextBlock("hi")])],
+            max_tokens=8,
+        )
+        assert captured[1] == "low"
+
+    def test_env_var_override_wins_over_observed_utilization(
+        self, monkeypatch, _stub_claude_agent_sdk_module
+    ):
+        """An explicit pin must not be second-guessed by telemetry."""
+        monkeypatch.setenv("OPENANT_CLAUDE_SUBSCRIPTION_EFFORT", "max")
+        mod._UtilizationTracker.update(0.95)  # would otherwise force "low"
+
+        sdk = _stub_claude_agent_sdk_module
+        captured = {}
+
+        async def fake_query(*, prompt, options):
+            captured["effort"] = options.effort
+            yield _FakeAssistantMessage(content=[_FakeTextBlock("hi")])
+            yield _FakeResultMessage()
+
+        sdk.query = fake_query
+        adapter = mod.ClaudeSubscriptionAdapter()
+        adapter.complete(
+            model="claude-opus-4-6", system=None,
+            messages=[Message(role="user", content=[TextBlock("hi")])],
+            max_tokens=8,
+        )
+        assert captured["effort"] == "max"
+
+    def test_reset_warnings_clears_tracker(self):
+        mod._UtilizationTracker.update(0.9)
+        assert mod._UtilizationTracker.current() == 0.9
+        mod.reset_warnings()
+        assert mod._UtilizationTracker.current() is None
+
+
+# ---------------------------------------------------------------------------
 # Happy path
 # ---------------------------------------------------------------------------
 
@@ -227,6 +394,55 @@ class TestTextCompletion:
     def test_pricing_is_always_zero(self):
         adapter = _make_adapter()
         assert adapter.pricing.get("claude-opus-4-6") == {"input": 0.0, "output": 0.0}
+
+    def test_cache_usage_is_read_through(self, monkeypatch):
+        """The SDK's usage dict carries cache_creation_input_tokens /
+        cache_read_input_tokens even though this adapter never requests
+        caching explicitly (see module docstring point 5) — must reach
+        CompletionResult, not be dropped."""
+        _stub_run_query(
+            monkeypatch,
+            lambda prompt, bridge: (
+                _assistant(
+                    [_text("hi there")],
+                    usage={
+                        "input_tokens": 2,
+                        "output_tokens": 6,
+                        "cache_creation_input_tokens": 23012,
+                        "cache_read_input_tokens": 19662,
+                    },
+                ),
+                _result(),
+            ),
+        )
+        adapter = _make_adapter()
+        result = adapter.complete(
+            model="claude-opus-4-6",
+            system=None,
+            messages=[Message(role="user", content=[TextBlock("hello")])],
+            max_tokens=64,
+        )
+        assert result.cache_creation_input_tokens == 23012
+        assert result.cache_read_input_tokens == 19662
+
+    def test_cache_usage_defaults_to_zero_when_absent(self, monkeypatch):
+        # Older/other SDK builds may omit these keys entirely; must not KeyError.
+        _stub_run_query(
+            monkeypatch,
+            lambda prompt, bridge: (
+                _assistant([_text("hi there")], usage={"input_tokens": 3, "output_tokens": 5}),
+                _result(),
+            ),
+        )
+        adapter = _make_adapter()
+        result = adapter.complete(
+            model="claude-opus-4-6",
+            system=None,
+            messages=[Message(role="user", content=[TextBlock("hello")])],
+            max_tokens=64,
+        )
+        assert result.cache_creation_input_tokens == 0
+        assert result.cache_read_input_tokens == 0
         assert adapter.pricing.get("anything-at-all") == {"input": 0.0, "output": 0.0}
 
 

@@ -109,7 +109,7 @@ Notes:
 - **No API key, no `base_url`.** The wizard skips straight past those prompts for this provider type; auth comes entirely from the `claude login` session the CLI subprocess reads at call time.
 - **Usage draws on your subscription's own cap**, not a service-account budget — running a scan spends the same Pro/Max usage you'd otherwise spend chatting with Claude. It resets on your plan's normal cycle; a `rate_limit` error from this provider usually just means "come back later," not "add a key."
 - **`enhance`/`verify` (tool-calling phases) work**, but through a best-effort bridge: this provider is Claude Code under the hood, which runs its own self-driving agent loop rather than exposing a raw completion API. OpenAnt's pipeline still executes every tool call itself — see the module docstring in `libs/openant-core/utilities/llm/providers/claude_subscription.py` for exactly how that bridge works and its known limitations (`max_tokens` is advisory only; each request is a fresh, stateless CLI session).
-- Model IDs are the same Claude model strings as the `anthropic` provider (e.g. `claude-opus-4-6`).
+- Model IDs are the same Claude model strings as the `anthropic` provider (e.g. `claude-sonnet-5`).
 
 #### Quick path for Anthropic-only setups
 
@@ -120,7 +120,7 @@ openant set-api-key sk-ant-...
 openant scan /path/to/repo
 ```
 
-This uses the built-in `openant-default` config (compiled into the binary, no `config.json` needed) — Claude Opus 4.6 for detection phases, Sonnet 4 for the rest.
+This uses the built-in `openant-default` config (compiled into the binary, no `config.json` needed) — Claude Sonnet 5 for every phase.
 
 #### Hand-authored config
 
