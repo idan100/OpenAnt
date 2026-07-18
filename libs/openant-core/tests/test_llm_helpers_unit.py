@@ -40,6 +40,7 @@ from utilities.llm import (
     PhaseBinding,
     PhaseRegistry,
     TextBlock,
+    effective_worker_count,
     lookup_pricing,
     probe_registry_or_raise,
 )
@@ -126,6 +127,33 @@ class TestLookupPricing:
             assert out == {"input": 15.00, "output": 75.00}, (
                 f"lookup_pricing should be phase-agnostic; failed for {phase!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# effective_worker_count
+# ---------------------------------------------------------------------------
+
+
+class TestEffectiveWorkerCount:
+    def _binding_with_rpm(self, rpm_limit):
+        return PhaseBinding(
+            phase="analyze", adapter=_AdapterWithPricing(), model="m",
+            provider_name="google", rpm_limit=rpm_limit,
+        )
+
+    def test_no_rpm_limit_leaves_requested_untouched(self):
+        assert effective_worker_count(self._binding_with_rpm(None), 8) == 8
+
+    def test_caps_to_rpm_limit_when_lower_than_requested(self):
+        assert effective_worker_count(self._binding_with_rpm(4), 8) == 4
+
+    def test_does_not_raise_requested_above_the_original_ask(self):
+        # An RPM ceiling higher than what was asked for shouldn't
+        # suddenly spin up MORE workers than the caller requested.
+        assert effective_worker_count(self._binding_with_rpm(50), 8) == 8
+
+    def test_rounds_and_floors_at_one_worker(self):
+        assert effective_worker_count(self._binding_with_rpm(0.4), 8) == 1
 
 
 # ---------------------------------------------------------------------------

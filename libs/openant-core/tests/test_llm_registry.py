@@ -47,9 +47,11 @@ class _FakeAdapter:
 
     instances: list["_FakeAdapter"] = []  # class-level so tests can inspect construction count
 
-    def __init__(self, *, api_key=None, base_url=None):
+    def __init__(self, *, api_key=None, base_url=None, name=None):
         self.api_key = api_key
         self.base_url = base_url
+        if name is not None:
+            self.name = name
         self.validate_calls: list[str] = []
         self.complete_calls: list[dict] = []
         type(self).instances.append(self)

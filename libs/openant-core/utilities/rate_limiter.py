@@ -1,18 +1,23 @@
 """
-Process-level rate limiter with coordinated backoff.
+Process-level rate limiter with coordinated backoff, keyed per provider.
 
-When any worker hits a 429 rate limit error, ALL workers pause for a
-configurable backoff period (default 30s). This prevents thundering herd
-and ensures the rate limit window has time to reset.
+When any worker hits a 429 rate limit error, ALL workers ON THE SAME
+PROVIDER pause for a configurable backoff period (default 30s). This
+prevents thundering herd and ensures the rate limit window has time to
+reset. Providers are isolated from each other: a Gemini 429 does not
+pause Anthropic/OpenAI workers, since they draw on entirely separate
+quota — see ``get_rate_limiter(provider=...)`` below. Workers sharing
+one provider still coordinate perfectly (the original PR #69 fix this
+module exists for).
 
 Usage:
     from utilities.rate_limiter import get_rate_limiter, configure_rate_limiter
 
-    # At startup (once)
+    # At startup (once) - sets the default backoff for every provider
     configure_rate_limiter(backoff_seconds=30)
 
-    # Before every API call
-    rate_limiter = get_rate_limiter()
+    # Before every API call - one limiter instance per provider name
+    rate_limiter = get_rate_limiter("anthropic")
     rate_limiter.wait_if_needed()
 
     # When catching RateLimitError
@@ -22,6 +27,7 @@ Usage:
         raise
 """
 
+import collections
 import random
 import sys
 import threading
@@ -30,28 +36,18 @@ import time
 
 class GlobalRateLimiter:
     """
-    Singleton rate limiter with coordinated backoff across all threads.
-
-    When any thread reports a rate limit error, all threads pause until
-    the backoff period expires. This ensures the organization-wide rate
-    limit window has time to reset.
+    Rate limiter with coordinated backoff across all threads sharing
+    this instance. Callers get one instance per provider name via the
+    module-level registry below, so coordination stays scoped to
+    workers hitting the SAME provider's quota.
     """
 
-    _instance = None
-    _init_lock = threading.Lock()
-
-    def __new__(cls, backoff_seconds: float = 30.0):
-        if cls._instance is None:
-            with cls._init_lock:
-                if cls._instance is None:
-                    instance = super().__new__(cls)
-                    instance._lock = threading.Lock()
-                    instance._backoff_until = 0.0
-                    instance._backoff_seconds = backoff_seconds
-                    instance._total_waits = 0
-                    instance._total_wait_time = 0.0
-                    cls._instance = instance
-        return cls._instance
+    def __init__(self, backoff_seconds: float = 30.0):
+        self._lock = threading.Lock()
+        self._backoff_until = 0.0
+        self._backoff_seconds = backoff_seconds
+        self._total_waits = 0
+        self._total_wait_time = 0.0
 
     @property
     def backoff_seconds(self) -> float:
@@ -147,50 +143,174 @@ class GlobalRateLimiter:
             self._total_wait_time = 0.0
 
 
-# Module-level singleton access
-_rate_limiter: GlobalRateLimiter | None = None
+# Module-level registry: one GlobalRateLimiter instance per provider
+# name, so a rate-limit pause on one provider doesn't stall workers on
+# an unrelated provider's quota.
+_DEFAULT_PROVIDER = "default"
+_rate_limiters: dict[str, GlobalRateLimiter] = {}
+_default_backoff_seconds = 30.0
 _config_lock = threading.Lock()
 
 
-def configure_rate_limiter(backoff_seconds: float = 30.0) -> GlobalRateLimiter:
+def configure_rate_limiter(
+    backoff_seconds: float = 30.0, provider: str = _DEFAULT_PROVIDER
+) -> GlobalRateLimiter:
     """
-    Configure the global rate limiter. Call once at startup.
+    Configure a provider's rate limiter. Call once per provider at startup
+    (or once with no ``provider`` to set the process-wide default new
+    provider limiters pick up when first created).
 
     Args:
-        backoff_seconds: How long to pause all workers on rate limit (default: 30s).
+        backoff_seconds: How long to pause this provider's workers on
+            rate limit (default: 30s).
+        provider: Provider name (e.g. "anthropic", "google"). Omit to
+            configure the shared default — this ALSO updates every
+            already-created provider limiter's backoff duration, matching
+            the pre-multi-provider behavior of one shared setting.
 
     Returns:
-        The configured GlobalRateLimiter singleton.
+        The configured GlobalRateLimiter for ``provider``.
     """
-    global _rate_limiter
+    global _default_backoff_seconds
     with _config_lock:
-        if _rate_limiter is None:
-            _rate_limiter = GlobalRateLimiter(backoff_seconds)
+        if provider == _DEFAULT_PROVIDER:
+            _default_backoff_seconds = backoff_seconds
+            for limiter in _rate_limiters.values():
+                limiter.backoff_seconds = backoff_seconds
+        limiter = _rate_limiters.get(provider)
+        if limiter is None:
+            limiter = GlobalRateLimiter(backoff_seconds)
+            _rate_limiters[provider] = limiter
         else:
-            _rate_limiter.backoff_seconds = backoff_seconds
-        return _rate_limiter
+            limiter.backoff_seconds = backoff_seconds
+        return limiter
 
 
-def get_rate_limiter() -> GlobalRateLimiter:
+def get_rate_limiter(provider: str = _DEFAULT_PROVIDER) -> GlobalRateLimiter:
     """
-    Get the global rate limiter singleton.
+    Get the rate limiter for ``provider``.
 
-    If not configured, creates one with default settings (30s backoff).
+    If not yet configured, creates one using the process-wide default
+    backoff (30s unless changed via ``configure_rate_limiter()``).
     """
-    global _rate_limiter
-    if _rate_limiter is None:
-        with _config_lock:
-            if _rate_limiter is None:
-                _rate_limiter = GlobalRateLimiter(30.0)
-    return _rate_limiter
+    with _config_lock:
+        limiter = _rate_limiters.get(provider)
+        if limiter is None:
+            limiter = GlobalRateLimiter(_default_backoff_seconds)
+            _rate_limiters[provider] = limiter
+        return limiter
 
 
 def reset_rate_limiter():
-    """Reset the rate limiter singleton. For testing."""
-    global _rate_limiter
+    """Reset every provider's rate limiter. For testing."""
     with _config_lock:
-        if _rate_limiter is not None:
-            _rate_limiter.reset()
+        for limiter in _rate_limiters.values():
+            limiter.reset()
+
+
+class RpmPacer:
+    """Proactive sliding-window request pacer for a fixed RPM ceiling.
+
+    Complements ``GlobalRateLimiter``: that class reacts to a 429
+    AFTER it happens (coordinated backoff). This paces requests BEFORE
+    they're sent so a known-tiny ceiling (e.g. a Gemini free-tier
+    model's 5-15 RPM) is rarely exceeded in the first place — several
+    parallel workers hammering a 5 RPM model otherwise 429 almost
+    immediately and repeatedly re-trigger the reactive backoff, which
+    is slower overall than just spacing requests out to begin with.
+
+    Enforces "no more than N requests in any trailing 60-second
+    window" by tracking request timestamps in a deque: once N are
+    in flight within the window, a new caller blocks until the
+    oldest one ages out.
+    """
+
+    def __init__(self, rpm_limit: float):
+        self._limit = max(1, round(rpm_limit))
+        self._lock = threading.Lock()
+        self._timestamps: collections.deque[float] = collections.deque()
+
+    def wait_for_slot(self) -> float:
+        """Block until a request is safe to send under the RPM ceiling.
+
+        Returns the time waited (0 if none). Records the slot as used
+        immediately upon returning — callers should call this
+        immediately before issuing the request, not speculatively.
+        """
+        total_wait = 0.0
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._timestamps and now - self._timestamps[0] >= 60.0:
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self._limit:
+                    self._timestamps.append(now)
+                    return total_wait
+                # Oldest slot ages out of the 60s window at this time.
+                wait_time = 60.0 - (now - self._timestamps[0])
+            # Sleep outside the lock so other threads can also check in.
+            # Small jitter avoids every blocked worker waking at the
+            # exact same instant and re-contending for the same slot.
+            this_wait = max(0.05, wait_time) + random.uniform(0, 0.5)
+            time.sleep(this_wait)
+            total_wait += this_wait
+
+    def has_immediate_slot(self) -> bool:
+        """Non-blocking peek: would ``wait_for_slot()`` return immediately?
+
+        Does NOT claim a slot — purely informational, for a round-robin
+        pool deciding which candidate to try first (see
+        ``providers/pool.py``). A slot can still be taken by another
+        thread between this call and an actual ``wait_for_slot()`` —
+        harmless race: worst case the caller picks a candidate that
+        then blocks briefly, no worse than not checking at all.
+        """
+        with self._lock:
+            now = time.monotonic()
+            active = sum(1 for t in self._timestamps if now - t < 60.0)
+            return active < self._limit
+
+    def reset(self) -> None:
+        """Clear tracked request history. For testing."""
+        with self._lock:
+            self._timestamps.clear()
+
+
+# Module-level registry: one RpmPacer per (provider, model) — RPM
+# ceilings are a property of a specific model, not a whole provider
+# (a single "google" provider can span models with very different
+# limits — see the ``gemini`` example config). None registered for a
+# given (provider, model) means no proactive pacing — current,
+# reactive-only behavior, unchanged unless a caller opts in.
+_rpm_pacers: dict[tuple[str, str], RpmPacer] = {}
+_rpm_config_lock = threading.Lock()
+
+
+def configure_rpm_limit(provider: str, model: str, rpm_limit: float | None) -> None:
+    """Register (or clear) a proactive RPM ceiling for (provider, model).
+
+    Called once per unique (provider, model) at registry-build time —
+    see ``utilities/llm/registry.py``. ``rpm_limit=None`` removes any
+    existing pacer for this key (no proactive pacing).
+    """
+    key = (provider, model)
+    with _rpm_config_lock:
+        if rpm_limit is None:
+            _rpm_pacers.pop(key, None)
+        else:
+            _rpm_pacers[key] = RpmPacer(rpm_limit)
+
+
+def get_rpm_pacer(provider: str, model: str) -> RpmPacer | None:
+    """Return the configured pacer for (provider, model), or None."""
+    with _rpm_config_lock:
+        return _rpm_pacers.get((provider, model))
+
+
+def reset_rpm_pacers() -> None:
+    """Clear every configured RPM pacer. For testing."""
+    with _rpm_config_lock:
+        _rpm_pacers.clear()
 
 
 def is_rate_limit_error(error_info: dict | str | None) -> bool:

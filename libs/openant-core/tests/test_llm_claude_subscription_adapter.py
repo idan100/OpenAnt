@@ -665,7 +665,7 @@ class TestErrorMapping:
                 max_tokens=8,
             )
         assert exc_info.value.retry_after == 7
-        assert get_rate_limiter().is_in_backoff()
+        assert get_rate_limiter("claude_subscription").is_in_backoff()
 
     def test_server_error_treated_as_rate_limit(self, monkeypatch):
         _stub_run_query(

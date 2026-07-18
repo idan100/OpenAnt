@@ -15,7 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utilities.llm_client import TokenTracker
-from utilities.llm import PhaseBinding, simple_text
+from utilities.llm import PhaseBinding, effective_worker_count, simple_text
 
 # Map language strings to Dockerfile template names
 LANGUAGE_MAP = {
@@ -342,6 +342,10 @@ def generate_tests_batch(
     """
     tracker = tracker or TokenTracker()
     total = len(findings)
+    # Don't spin up more concurrent workers than this phase's model
+    # can usefully serve per minute. No-op unless the binding has a
+    # configured rpm_limit.
+    workers = effective_worker_count(binding, workers)
 
     mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
     print(f"[DynamicTest] Generating tests for {total} findings, mode: {mode}", file=sys.stderr, flush=True)

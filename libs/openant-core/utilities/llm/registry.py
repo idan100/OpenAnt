@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from ..rate_limiter import configure_rpm_limit
 from .adapter import LLMAdapter
 from .builtins import get_builtin_default
 from .config import (
@@ -54,6 +55,8 @@ from .config import (
     parse_config,
 )
 from .providers import get_adapter_class
+from .providers.failover import ExhaustionState, FailoverAdapter
+from .providers.pool import PoolAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +131,26 @@ def resolve_llm_config(cf: ConfigFile, name: Optional[str]) -> LLMConfig:
     )
 
 
+def resolve_fallback_config(cf: ConfigFile, llm_config: LLMConfig) -> Optional[LLMConfig]:
+    """Resolve ``llm_config.fallback`` (a name) into an :class:`LLMConfig`.
+
+    Returns None when no fallback is configured. Reuses
+    :func:`resolve_llm_config`'s name resolution (handles
+    ``"openant-default"`` and user-defined configs identically, same
+    "not found" error quality) — the fallback name is looked up
+    exactly like an explicit ``--llm-config`` value would be.
+
+    Deliberately only one level deep: the fallback config's OWN
+    ``fallback`` field (if it has one) is ignored, not chased further.
+    Chained failover adds real complexity (loop detection, cascading
+    exhaustion state) for a scenario ("your fallback ALSO ran out")
+    that's rare enough to not be worth it today.
+    """
+    if llm_config.fallback is None:
+        return None
+    return resolve_llm_config(cf, llm_config.fallback)
+
+
 # ---------------------------------------------------------------------------
 # Provider resolution
 # ---------------------------------------------------------------------------
@@ -180,6 +203,7 @@ def build_adapter(provider: ProviderConfig) -> LLMAdapter:
         return adapter_cls(
             api_key=provider.api_key,
             base_url=provider.base_url,
+            name=provider.name,
         )
     except Exception as exc:  # noqa: BLE001 — re-raise as typed
         raise LLMAuthError(
@@ -199,12 +223,21 @@ def build_adapter(provider: ProviderConfig) -> LLMAdapter:
 
 @dataclass(frozen=True)
 class PhaseBinding:
-    """One row in a PhaseRegistry: a phase → (adapter, model) link."""
+    """One row in a PhaseRegistry: a phase → (adapter, model) link.
+
+    ``rpm_limit``: the configured RPM ceiling for this phase's
+    (provider, model), if any — mirrors the ``PhaseRef`` it was built
+    from. Pipeline code sizing a worker pool can read this to avoid
+    spinning up more concurrent workers than the model can usefully
+    serve (see ``core/analyzer.py`` etc.); the pacing itself already
+    happens inside the adapter regardless of worker count.
+    """
 
     phase: str
     adapter: LLMAdapter
     model: str
     provider_name: str
+    rpm_limit: Optional[float] = None
 
 
 class PhaseRegistry:
@@ -215,9 +248,19 @@ class PhaseRegistry:
     thread-safe (adapters are stateless dispatchers).
     """
 
-    def __init__(self, bindings: dict[str, PhaseBinding], config_name: str):
+    def __init__(
+        self,
+        bindings: dict[str, PhaseBinding],
+        config_name: str,
+        fallback_probe_targets: Optional[list[tuple[LLMAdapter, str]]] = None,
+    ):
         self._bindings = bindings
         self._config_name = config_name
+        # (adapter, model) pairs for a configured fallback, probed
+        # directly (bypassing any FailoverAdapter wrapper) so a broken
+        # fallback is caught at scan startup, not hours in when it's
+        # actually needed. Empty when no fallback is configured.
+        self._fallback_probe_targets = fallback_probe_targets or []
 
     @property
     def config_name(self) -> str:
@@ -242,8 +285,11 @@ class PhaseRegistry:
     def unique_probe_targets(self) -> list[tuple[str, str]]:
         """All distinct ``(provider_name, model)`` pairs across phases.
 
-        Used by :meth:`validate` to probe each pair exactly once.
-        Two phases sharing the same provider+model don't double-probe.
+        Diagnostic utility (e.g. for a future ``openant llm-config
+        show``) — no longer used internally by :meth:`validate`, which
+        iterates per-phase instead (see its docstring for why: pools
+        can make two phases sharing a top-level (provider, model)
+        resolve to entirely different actual candidate sets).
         """
         seen: set[tuple[str, str]] = set()
         for binding in self._bindings.values():
@@ -251,7 +297,7 @@ class PhaseRegistry:
         return sorted(seen)
 
     def validate(self) -> None:
-        """Probe every unique ``(provider, model)`` pair.
+        """Probe every phase's binding, plus the configured fallback (if any).
 
         Called at scan startup by ``scan_repository`` and at the head
         of every standalone step verb (analyze, enhance, verify,
@@ -260,14 +306,41 @@ class PhaseRegistry:
         — no point probing the rest of a broken config. The exception
         type is the adapter's :class:`LLMError` subclass; callers
         catch :class:`LLMError` and surface a user-friendly message.
+
+        Iterates per-PHASE rather than deduping by (provider, model):
+        with round-robin pools (see ``providers/pool.py``), two phases
+        CAN share the same top-level (provider, model) while having
+        entirely different pool members, so a naive provider+model
+        dedup could silently skip probing one phase's actual pool.
+        Redundant probes against a truly-shared plain adapter still
+        collapse to one real network call via ``probe_cache.py``'s
+        finer-grained (adapter, model) cache — see below — so this
+        isn't slower in the common (unpooled) case.
+
+        Skips a probe entirely when the SAME (adapter, model) pair
+        validated successfully within the last 30 minutes (see
+        ``probe_cache.py``) — most relevant to the configured fallback
+        and to pool members, which would otherwise burn a validation
+        request on every single scan even when barely used.
         """
-        # Group probes by provider name so the error message can name
-        # the offending provider, not just the model.
-        adapters_by_provider: dict[str, LLMAdapter] = {}
+        from .probe_cache import mark_validated, was_recently_validated
+
         for binding in self._bindings.values():
-            adapters_by_provider[binding.provider_name] = binding.adapter
-        for provider_name, model in self.unique_probe_targets():
-            adapters_by_provider[provider_name].validate(model)
+            adapter = binding.adapter
+            # For a pooled/failed-over binding this check uses a
+            # synthesized (non-real) identity and is a harmless,
+            # near-always-miss no-op — the wrapper's OWN validate()
+            # does correct per-member caching internally (see
+            # PoolAdapter.validate() / FailoverAdapter.validate()).
+            if was_recently_validated(adapter.name, binding.model):
+                continue
+            adapter.validate(binding.model)
+            mark_validated(adapter.name, binding.model)
+        for adapter, model in self._fallback_probe_targets:
+            if was_recently_validated(adapter.name, model):
+                continue
+            adapter.validate(model)
+            mark_validated(adapter.name, model)
 
 
 def probe_registry_or_raise(registry: PhaseRegistry) -> None:
@@ -297,44 +370,130 @@ def probe_registry_or_raise(registry: PhaseRegistry) -> None:
         raise
 
 
+def _provider_names_in(llm_config: LLMConfig) -> set[str]:
+    """Every provider name a config's phases reference — primary AND
+    pool members."""
+    names: set[str] = set()
+    for ref in llm_config.phases.values():
+        names.add(ref.provider)
+        for member in ref.pool:
+            names.add(member.provider)
+    return names
+
+
+def _resolve_phase_adapter(
+    ref: PhaseRef, phase: str, adapters: dict[str, LLMAdapter]
+) -> LLMAdapter:
+    """Build the (possibly pooled) adapter for one phase's ref.
+
+    Registers this ref's RPM limit (and every pool member's) with the
+    process-wide pacer registry as a side effect. ``adapters`` must
+    already contain an entry for every provider ``ref`` (and its pool
+    members) reference — see ``build_phase_registry``.
+    """
+    configure_rpm_limit(ref.provider, ref.model, ref.rpm_limit)
+    if not ref.pool:
+        return adapters[ref.provider]
+    candidates: list[tuple[LLMAdapter, str, str]] = [
+        (adapters[ref.provider], ref.model, ref.provider)
+    ]
+    for member in ref.pool:
+        configure_rpm_limit(member.provider, member.model, member.rpm_limit)
+        candidates.append((adapters[member.provider], member.model, member.provider))
+    return PoolAdapter(candidates=candidates, phase=phase)
+
+
 def build_phase_registry(
     cf: ConfigFile, llm_config: LLMConfig
 ) -> PhaseRegistry:
     """Eagerly instantiate every adapter the llm-config needs.
 
-    One adapter per unique provider name (not per phase). Phases that
-    share a provider reuse the same adapter instance — which is
-    correct because adapters are stateless dispatchers and the SDK
-    clients underneath are thread-safe.
-    """
-    # First pass: pick out the unique provider names referenced.
-    unique_providers: dict[str, ProviderConfig] = {}
-    for ref in llm_config.phases.values():
-        if ref.provider not in unique_providers:
-            unique_providers[ref.provider] = resolve_provider(cf, ref.provider)
+    One adapter per unique provider name (not per phase, and not per
+    pool membership) — phases (and pools) that share a provider reuse
+    the same adapter instance, correct because adapters are stateless
+    dispatchers and the SDK clients underneath are thread-safe.
 
-    # Second pass: instantiate one adapter per provider.
+    A phase whose ``PhaseRef.pool`` is non-empty gets a
+    :class:`~.pool.PoolAdapter` round-robining its primary
+    ``{provider, model}`` together with every pool member — active
+    load balancing across several SEPARATE quota pools at once (a
+    Claude subscription plus free-tier API keys, say), not just
+    primary-then-backup. See ``providers/pool.py``.
+
+    When ``llm_config.fallback`` names another config, each phase's
+    (possibly pooled) adapter is wrapped in a :class:`FailoverAdapter`
+    that transparently switches to the fallback's (possibly ALSO
+    pooled) resolution for that phase after a hard usage-cap signal —
+    see ``providers/failover.py``. Phases sharing a primary provider
+    share one :class:`ExhaustionState`, so exhaustion discovered via
+    any one of them protects the rest immediately. No fallback
+    configured (the default) means zero wrapping — behavior is 100%
+    unchanged from before failover existed. Neither pooling nor
+    failover touch any pipeline call site — they live entirely here,
+    inside adapter construction.
+    """
+    fallback_config = resolve_fallback_config(cf, llm_config)
+
+    # One adapter per unique provider name referenced ANYWHERE this
+    # config needs one — primary phases, their pools, the fallback
+    # config's phases, and ITS pools. Built once, shared by every
+    # reference (a provider used as both a primary and a pool member
+    # across different phases gets exactly one adapter instance).
+    provider_names = _provider_names_in(llm_config)
+    if fallback_config is not None:
+        provider_names |= _provider_names_in(fallback_config)
     adapters: dict[str, LLMAdapter] = {
-        name: build_adapter(provider)
-        for name, provider in unique_providers.items()
+        name: build_adapter(resolve_provider(cf, name)) for name in provider_names
     }
 
-    # Third pass: build phase bindings reusing the per-provider adapters.
+    # Build phase bindings. One ExhaustionState per PRIMARY provider
+    # name, shared across every phase using that provider as primary.
+    exhaustion_states: dict[str, ExhaustionState] = {}
+    fallback_probe_targets: dict[tuple[str, str], tuple[LLMAdapter, str]] = {}
     bindings: dict[str, PhaseBinding] = {}
     for phase, ref in llm_config.phases.items():
+        primary_side = _resolve_phase_adapter(ref, phase, adapters)
+        adapter: LLMAdapter = primary_side
+        if fallback_config is not None:
+            fb_ref = fallback_config.phases[phase]  # full phase coverage guaranteed
+            fallback_side = _resolve_phase_adapter(fb_ref, phase, adapters)
+            state = exhaustion_states.setdefault(ref.provider, ExhaustionState())
+            adapter = FailoverAdapter(
+                primary=primary_side,
+                primary_model=ref.model,
+                fallback=fallback_side,
+                fallback_model=fb_ref.model,
+                phase=phase,
+                exhaustion_state=state,
+            )
+            fallback_probe_targets[(fb_ref.provider, fb_ref.model)] = (
+                adapters[fb_ref.provider], fb_ref.model,
+            )
+            for member in fb_ref.pool:
+                fallback_probe_targets[(member.provider, member.model)] = (
+                    adapters[member.provider], member.model,
+                )
         bindings[phase] = PhaseBinding(
             phase=phase,
-            adapter=adapters[ref.provider],
+            adapter=adapter,
             model=ref.model,
             provider_name=ref.provider,
+            rpm_limit=ref.rpm_limit,
         )
 
     # Tool-support gating (plan §5): enhance + verify require an
     # adapter with supports_tools=True. Catch this here rather than
-    # at the first call site, so init can fail loudly.
+    # at the first call site, so init can fail loudly. FailoverAdapter
+    # only reports True when BOTH sides support tools, and PoolAdapter
+    # only when EVERY member does, so a fallback or pool member that
+    # can't do tool calling is caught right here too.
     _check_tool_support(bindings)
 
-    return PhaseRegistry(bindings=bindings, config_name=llm_config.name)
+    return PhaseRegistry(
+        bindings=bindings,
+        config_name=llm_config.name,
+        fallback_probe_targets=list(fallback_probe_targets.values()),
+    )
 
 
 _TOOL_PHASES = ("enhance", "verify")

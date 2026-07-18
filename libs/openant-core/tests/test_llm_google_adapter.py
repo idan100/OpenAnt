@@ -74,7 +74,7 @@ def test_rate_limit_reports_to_global_limiter():
     from tests._llm_factories.google import make_adapter
 
     adapter = make_adapter("rate_limit")  # scripted to raise a 429 (retry_after=7)
-    limiter = get_rate_limiter()
+    limiter = get_rate_limiter("google")
     assert not limiter.is_in_backoff()
     with pytest.raises(LLMRateLimitError):
         adapter.complete(

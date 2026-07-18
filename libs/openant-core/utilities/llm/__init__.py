@@ -44,6 +44,7 @@ from .config import (
     ConfigFile,
     LLMConfig,
     PhaseRef,
+    PoolMember,
     ProviderConfig,
     empty_config,
     parse_config,
@@ -59,10 +60,11 @@ from .registry import (
     default_config_path,
     load_config_file,
     probe_registry_or_raise,
+    resolve_fallback_config,
     resolve_llm_config,
     resolve_provider,
 )
-from .helpers import lookup_pricing, simple_text
+from .helpers import effective_worker_count, lookup_pricing, simple_text
 
 __all__ = [
     # adapter
@@ -91,6 +93,7 @@ __all__ = [
     "ConfigFile",
     "LLMConfig",
     "PhaseRef",
+    "PoolMember",
     "ProviderConfig",
     "empty_config",
     "parse_config",
@@ -105,9 +108,11 @@ __all__ = [
     "default_config_path",
     "load_config_file",
     "probe_registry_or_raise",
+    "resolve_fallback_config",
     "resolve_llm_config",
     "resolve_provider",
     # helpers
+    "effective_worker_count",
     "lookup_pricing",
     "simple_text",
 ]

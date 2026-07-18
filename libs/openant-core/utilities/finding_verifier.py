@@ -47,6 +47,7 @@ from .llm import (
     ToolDef,
     ToolResultBlock,
     ToolUseBlock,
+    effective_worker_count,
     lookup_pricing,
 )
 
@@ -747,6 +748,10 @@ class FindingVerifier:
     def _verify_batch_parallel(self, results, code_by_route, progress_callback, workers,
                                 checkpoint=None, summary_callback=None):
         """Verify all results in parallel using ThreadPoolExecutor."""
+        # Don't spin up more concurrent workers than this phase's model
+        # can usefully serve per minute. No-op unless the binding has a
+        # configured rpm_limit.
+        workers = effective_worker_count(self.binding, workers)
         executor = ThreadPoolExecutor(max_workers=workers)
         future_to_result = {}
         for result in results:

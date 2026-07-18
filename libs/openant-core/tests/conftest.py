@@ -41,3 +41,24 @@ def sample_js_repo():
 def tmp_output_dir(tmp_path):
     """Temporary output directory for parser results."""
     return str(tmp_path / "output")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_probe_cache(tmp_path, monkeypatch):
+    """Never let any test read/write the real ~/.config/openant/probe_cache.json.
+
+    PhaseRegistry.validate() consults this cache (see
+    utilities/llm/probe_cache.py) to skip re-probing a recently-validated
+    (adapter, model) pair. Without this fixture, any test that calls
+    validate() with a real (unmocked) cache path pollutes the actual
+    user's on-disk cache with fake test provider/model names — and,
+    worse, cross-contaminates OTHER tests within the same pytest run:
+    whichever test happens to run first writes e.g. "anthropic:m" to
+    the real file, and every later test using that same fake pair then
+    sees "recently validated" and silently skips its own validate()
+    call, breaking assertions that expected it to actually run.
+    """
+    from utilities.llm import probe_cache
+
+    fake_path = tmp_path / "probe_cache.json"
+    monkeypatch.setattr(probe_cache, "_cache_path", lambda: fake_path)

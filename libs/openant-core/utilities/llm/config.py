@@ -87,11 +87,37 @@ class ProviderConfig:
 
 
 @dataclass(frozen=True)
-class PhaseRef:
-    """One ``{provider, model}`` pair inside an LLM config."""
+class PoolMember:
+    """One additional round-robin candidate for a phase, alongside its
+    primary ``{provider, model}`` — see ``PhaseRef.pool``."""
 
     provider: str
     model: str
+    rpm_limit: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class PhaseRef:
+    """One ``{provider, model}`` pair inside an LLM config.
+
+    ``rpm_limit``: optional known requests-per-minute ceiling for this
+    (provider, model) pair. ``None`` (the default) means no proactive
+    pacing — 100% today's reactive-backoff-only behavior. Set it when
+    you know a hard, tight limit (e.g. a Gemini free-tier model) so
+    calls are paced under that ceiling instead of firing in parallel
+    and 429-ing. See ``utilities/rate_limiter.py``'s ``RpmPacer``.
+
+    ``pool``: additional ``{provider, model}`` candidates to actively
+    round-robin THIS phase's calls across, alongside the primary
+    ``{provider, model}`` above — see
+    ``utilities/llm/providers/pool.py``. Empty (the default) means
+    just the single primary — 100% today's behavior, unchanged.
+    """
+
+    provider: str
+    model: str
+    rpm_limit: Optional[float] = None
+    pool: tuple[PoolMember, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -104,10 +130,19 @@ class LLMConfig:
     ``TypeError`` instead of silently editing a config that's
     supposed to be immutable. Callers pass a regular dict at
     construction and it's normalised in ``__post_init__``.
+
+    ``fallback``: name of another llm-config (or ``"openant-default"``)
+    to fail over to, per phase, when this config's provider signals a
+    hard usage-cap exhaustion mid-scan rather than an ordinary
+    transient rate limit. ``None`` (the default) means no failover —
+    100% unchanged behavior. See
+    ``utilities/llm/providers/failover.py`` for the mechanism and
+    ``registry.build_phase_registry`` for where it's wired in.
     """
 
     name: str
     phases: Mapping[str, PhaseRef]
+    fallback: Optional[str] = None
 
     def __post_init__(self) -> None:
         missing = [p for p in PHASES if p not in self.phases]
@@ -288,11 +323,21 @@ def _parse_configs(raw: dict) -> dict[str, LLMConfig]:
             raise ConfigError(
                 f"config.json: llm-config {name!r} must be a JSON object"
             )
+        # "fallback" is a config-level key, not a phase — pull it out
+        # before the phase loop so it doesn't get mistaken for an
+        # unknown phase by LLMConfig.__post_init__'s coverage check.
+        entry = dict(entry)
+        fallback = entry.pop("fallback", None)
+        if fallback is not None and not isinstance(fallback, str):
+            raise ConfigError(
+                f"config.json: llm-config {name!r}: 'fallback' must be a "
+                f"string naming another llm-config"
+            )
         phases: dict[str, PhaseRef] = {}
         for phase_key, phase_entry in entry.items():
             phases[phase_key] = _parse_phase_ref(name, phase_key, phase_entry)
         # LLMConfig.__post_init__ raises if PHASES coverage is wrong.
-        out[name] = LLMConfig(name=name, phases=phases)
+        out[name] = LLMConfig(name=name, phases=phases, fallback=fallback)
     return out
 
 
@@ -314,7 +359,51 @@ def _parse_phase_ref(config_name: str, phase: str, entry) -> PhaseRef:
             f"config.json: llm-config {config_name!r} phase {phase!r}: "
             f"'model' must be a non-empty string"
         )
-    return PhaseRef(provider=provider, model=model)
+    rpm_limit = entry.get("rpm_limit")
+    if rpm_limit is not None and not isinstance(rpm_limit, (int, float)):
+        raise ConfigError(
+            f"config.json: llm-config {config_name!r} phase {phase!r}: "
+            f"'rpm_limit' must be a number"
+        )
+    pool = _parse_pool(config_name, phase, entry.get("pool"))
+    return PhaseRef(provider=provider, model=model, rpm_limit=rpm_limit, pool=pool)
+
+
+def _parse_pool(config_name: str, phase: str, raw) -> tuple[PoolMember, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError(
+            f"config.json: llm-config {config_name!r} phase {phase!r}: "
+            f"'pool' must be a list"
+        )
+    members: list[PoolMember] = []
+    for i, member_entry in enumerate(raw):
+        if not isinstance(member_entry, dict):
+            raise ConfigError(
+                f"config.json: llm-config {config_name!r} phase {phase!r}: "
+                f"'pool[{i}]' must be an object"
+            )
+        m_provider = member_entry.get("provider")
+        m_model = member_entry.get("model")
+        if not isinstance(m_provider, str) or not m_provider:
+            raise ConfigError(
+                f"config.json: llm-config {config_name!r} phase {phase!r}: "
+                f"'pool[{i}].provider' must be a non-empty string"
+            )
+        if not isinstance(m_model, str) or not m_model:
+            raise ConfigError(
+                f"config.json: llm-config {config_name!r} phase {phase!r}: "
+                f"'pool[{i}].model' must be a non-empty string"
+            )
+        m_rpm = member_entry.get("rpm_limit")
+        if m_rpm is not None and not isinstance(m_rpm, (int, float)):
+            raise ConfigError(
+                f"config.json: llm-config {config_name!r} phase {phase!r}: "
+                f"'pool[{i}].rpm_limit' must be a number"
+            )
+        members.append(PoolMember(provider=m_provider, model=m_model, rpm_limit=m_rpm))
+    return tuple(members)
 
 
 def _validate_phase_references(cf: ConfigFile) -> None:
@@ -339,6 +428,13 @@ def _validate_phase_references(cf: ConfigFile) -> None:
                     f"unknown provider {ref.provider!r}. Defined providers: "
                     f"{sorted(cf.llm_providers) or 'none'}."
                 )
+            for member in ref.pool:
+                if member.provider not in cf.llm_providers and member.provider != "anthropic":
+                    raise ConfigError(
+                        f"llm-config {config.name!r} phase {phase!r} pool member "
+                        f"references unknown provider {member.provider!r}. "
+                        f"Defined providers: {sorted(cf.llm_providers) or 'none'}."
+                    )
 
 
 def _optional_str(value) -> Optional[str]:
@@ -394,10 +490,24 @@ def _serialise_provider(p: ProviderConfig) -> dict:
 
 
 def _serialise_config(c: LLMConfig) -> dict:
-    return {
-        phase: {"provider": ref.provider, "model": ref.model}
-        for phase, ref in c.phases.items()
-    }
+    out: dict = {}
+    for phase, ref in c.phases.items():
+        entry = {"provider": ref.provider, "model": ref.model}
+        if ref.rpm_limit is not None:
+            entry["rpm_limit"] = ref.rpm_limit
+        if ref.pool:
+            entry["pool"] = [_serialise_pool_member(m) for m in ref.pool]
+        out[phase] = entry
+    if c.fallback:
+        out["fallback"] = c.fallback
+    return out
+
+
+def _serialise_pool_member(m: PoolMember) -> dict:
+    entry = {"provider": m.provider, "model": m.model}
+    if m.rpm_limit is not None:
+        entry["rpm_limit"] = m.rpm_limit
+    return entry
 
 
 # ---------------------------------------------------------------------------

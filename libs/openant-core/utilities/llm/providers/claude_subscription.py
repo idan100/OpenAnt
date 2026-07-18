@@ -312,12 +312,19 @@ class ClaudeSubscriptionAdapter:
         *,
         api_key: Optional[str] = None,  # noqa: ARG002 - signature parity, unused
         base_url: Optional[str] = None,  # noqa: ARG002 - signature parity, unused
+        name: Optional[str] = None,
     ):
-        # ``api_key``/``base_url`` are accepted (and ignored) so
-        # ``registry.build_adapter`` — which always passes both — can
-        # construct this adapter without a special case. There's no
-        # key to check: auth comes from the local `claude login`
-        # session the ``claude`` CLI reads at subprocess-spawn time.
+        # ``api_key``/``base_url``/``name`` are accepted so
+        # ``registry.build_adapter`` — which always passes all three —
+        # can construct this adapter without a special case.
+        # ``api_key``/``base_url`` are unused: there's no key to check,
+        # auth comes from the local `claude login` session the
+        # ``claude`` CLI reads at subprocess-spawn time. ``name``
+        # overrides the class-level ``"claude_subscription"`` identity
+        # used for rate-limit keying, for the unusual case of more
+        # than one such provider entry configured at once.
+        if name is not None:
+            self.name = name
         try:
             import claude_agent_sdk  # noqa: F401
         except ImportError as exc:
@@ -355,7 +362,7 @@ class ClaudeSubscriptionAdapter:
         max_tokens: int,  # noqa: ARG002 - advisory only, see module docstring point 3
         tools: Optional[list[ToolDef]] = None,
     ) -> CompletionResult:
-        wait_for_rate_limit()
+        wait_for_rate_limit(self.name, model)
 
         prompt = _flatten_transcript(messages)
         system_prompt = system if system is not None else ""
@@ -399,7 +406,7 @@ class ClaudeSubscriptionAdapter:
         try:
             return _translate(first_assistant, last_result)
         except LLMRateLimitError as exc:
-            report_rate_limit(exc.retry_after)
+            report_rate_limit(self.name, exc.retry_after)
             raise
 
     def validate(self, model: str) -> None:

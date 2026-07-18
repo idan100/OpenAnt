@@ -139,6 +139,7 @@ class AnthropicAdapter:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         max_retries: int = 5,
+        name: Optional[str] = None,
         _client: Optional[anthropic.Anthropic] = None,
     ):
         """Construct the adapter.
@@ -152,9 +153,19 @@ class AnthropicAdapter:
             max_retries: Forwarded to the SDK. The SDK's built-in
                 retry covers transient network blips; our rate
                 limiter handles 429-coordinated backoff on top.
+            name: Overrides the class-level ``"anthropic"`` identity
+                used for rate-limit/RPM-pacer keying (see
+                ``_ratelimit.py``). Set this to the config's provider
+                NAME whenever more than one Anthropic-format endpoint
+                is configured at once — otherwise they'd all share one
+                rate-limit bucket. ``build_adapter`` passes this
+                automatically.
             _client: Injected SDK instance for testing. Production
                 callers should not pass this.
         """
+        if name is not None:
+            self.name = name
+
         if _client is not None:
             self._client = _client
             return
@@ -207,7 +218,7 @@ class AnthropicAdapter:
         # Cooperate with the cross-worker backoff before issuing the
         # call — same pattern the legacy AnthropicClient used, now
         # shared with the OpenAI and Google adapters (see _ratelimit.py).
-        wait_for_rate_limit()
+        wait_for_rate_limit(self.name, model)
 
         try:
             response = self._client.messages.create(**request)
@@ -219,7 +230,7 @@ class AnthropicAdapter:
             raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except anthropic.RateLimitError as exc:
             retry_after = _retry_after_from(exc)
-            report_rate_limit(retry_after)
+            report_rate_limit(self.name, retry_after)
             raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
         except anthropic.NotFoundError as exc:
             raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
@@ -233,7 +244,7 @@ class AnthropicAdapter:
             status = getattr(exc, "status_code", None)
             if status == 529:
                 retry_after = _retry_after_from(exc)
-                report_rate_limit(retry_after)
+                report_rate_limit(self.name, retry_after)
                 raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
             # Everything else (400, 422, 500, ...) is a structural
             # response problem from the pipeline's perspective.

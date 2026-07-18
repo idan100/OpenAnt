@@ -33,6 +33,7 @@ from .llm import (
     LLMRateLimitError,
     LLMResponseError,
     PhaseBinding,
+    effective_worker_count,
     simple_text,
 )
 from .agentic_enhancer import RepositoryIndex, enhance_unit_with_agent, load_index_from_file
@@ -394,6 +395,10 @@ class ContextEnhancer:
             self._log("info", f"Diff filter: {_pre} -> {len(units)} units")
 
         total = len(units)
+        # Don't spin up more concurrent workers than this phase's model
+        # can usefully serve per minute. No-op unless the binding has a
+        # configured rpm_limit.
+        workers = effective_worker_count(self.binding, workers)
 
         # Checkpoint directory setup + resume (mirror enhance_dataset_agentic).
         checkpoint_dir = None
@@ -565,6 +570,10 @@ class ContextEnhancer:
             self._log("info", f"Diff filter: {_pre} -> {len(units)} units")
 
         total = len(units)
+        # Don't spin up more concurrent workers than this phase's model
+        # can usefully serve per minute. No-op unless the binding has a
+        # configured rpm_limit.
+        workers = effective_worker_count(self.binding, workers)
 
         # Checkpoint directory setup
         checkpoint_dir = None
@@ -772,7 +781,7 @@ class ContextEnhancer:
             if not retryable_units:
                 break
 
-            rate_limiter = get_rate_limiter()
+            rate_limiter = get_rate_limiter(self.binding.provider_name)
             backoff = rate_limiter.time_until_ready()
             if backoff > 0:
                 self._log("info",

@@ -50,10 +50,36 @@ Translation details (read ``HOW_TO_ADD_AN_ADAPTER.md`` §3 first):
   ``httpx.ConnectError`` / ``httpx.TimeoutException`` since the
   SDK doesn't wrap them — caught and re-raised as
   :class:`LLMConnectionError`.
+
+* **Context caching, opt-in and OFF by default.** Pass
+  ``enable_context_caching=True`` to reuse Gemini's explicit
+  ``client.caches`` API for a phase's fixed ``system`` prompt (+
+  ``tools``, when present) across repeated calls, instead of paying
+  full input-token price for that prefix on every single call. Cache
+  hits are looked up by a hash of ``(model, system, tools)`` in an
+  in-memory, instance-scoped dict (adapter instances already live for
+  a whole phase/scan — see the registry's "one adapter per provider"
+  design) — thread-safe, lazily created on first use, gracefully
+  falling back to an uncached call on ANY creation failure (Gemini
+  enforces an undocumented-here minimum token count per model
+  generation; rather than hard-code a number that drifts, a failed
+  ``caches.create`` just means this call proceeds without caching). A
+  cache that expires mid-scan (``cached_content`` 404s) is dropped and
+  the call retried once, uncached, rather than failing outright.
+
+  Deliberately default-OFF: caching only pays off when TOKEN cost is
+  the bottleneck (a metered/paid tier). On a REQUEST-constrained free
+  tier (RPM/RPD caps, generous TPM) it's neutral-to-harmful — cache
+  creation is itself an extra API call, i.e. an extra request against
+  the same scarce per-model daily quota this adapter's callers are
+  usually trying to conserve. Enable it once cost, not request count,
+  is what you're optimizing.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 import threading
 from typing import Any, Optional
@@ -169,6 +195,8 @@ class GoogleAdapter:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         max_retries: int = 5,
+        enable_context_caching: bool = False,
+        name: Optional[str] = None,
         _client: Optional[genai.Client] = None,
     ):
         """Construct the adapter.
@@ -186,8 +214,27 @@ class GoogleAdapter:
                 ``HttpRetryOptions.attempts``); on top of the SDK's own
                 retry, our rate limiter coordinates 429 backoff across
                 workers — same division of labour as the other adapters.
+            enable_context_caching: Reuse Gemini's explicit ``caches``
+                API for the (system, tools) prefix across calls. Default
+                OFF — see the module docstring's context-caching section
+                for why this isn't on by default.
+            name: Overrides the class-level ``"google"`` identity used
+                for rate-limit/RPM-pacer keying (see ``_ratelimit.py``).
+                Set this to the config's provider NAME whenever more
+                than one Gemini-compat endpoint is configured at once.
+                ``build_adapter`` passes this automatically.
             _client: Injected SDK instance for testing.
         """
+        # Set unconditionally, BEFORE the injected-client early return
+        # below, so a test constructing this adapter with ``_client=``
+        # still gets a fully-initialised instance (complete() reads
+        # these regardless of which construction path was taken).
+        self._enable_context_caching = enable_context_caching
+        self._cache_lock = threading.Lock()
+        self._caches: dict[str, str] = {}  # cache key -> CachedContent.name
+        if name is not None:
+            self.name = name
+
         if _client is not None:
             self._client = _client
             return
@@ -236,16 +283,44 @@ class GoogleAdapter:
         max_tokens: int,
         tools: Optional[list[ToolDef]] = None,
     ) -> CompletionResult:
+        return self._complete_once(
+            model=model, system=system, messages=messages,
+            max_tokens=max_tokens, tools=tools, use_cache=True,
+        )
+
+    def _complete_once(
+        self,
+        *,
+        model: str,
+        system: Optional[str],
+        messages: list[Message],
+        max_tokens: int,
+        tools: Optional[list[ToolDef]],
+        use_cache: bool,
+    ) -> CompletionResult:
         contents = [_message_to_gemini(m) for m in messages]
         config_kwargs: dict[str, Any] = {"max_output_tokens": max_tokens}
-        if system is not None:
-            config_kwargs["system_instruction"] = system
-        if tools:
-            config_kwargs["tools"] = [_tool_to_gemini(t) for t in tools]
+
+        cache_key = None
+        cache_name = None
+        if use_cache and self._enable_context_caching and system:
+            cache_key = _cache_key(model, system, tools)
+            cache_name = self._get_or_create_cache(model, system, tools, cache_key)
+
+        if cache_name is not None:
+            # The cached content already carries system_instruction/tools
+            # server-side — re-sending them here would be redundant (and
+            # some SDK versions reject the combination outright).
+            config_kwargs["cached_content"] = cache_name
+        else:
+            if system is not None:
+                config_kwargs["system_instruction"] = system
+            if tools:
+                config_kwargs["tools"] = [_tool_to_gemini(t) for t in tools]
 
         # Cooperate with cross-worker backoff before issuing the call —
         # same dance the Anthropic adapter does (see _ratelimit.py).
-        wait_for_rate_limit()
+        wait_for_rate_limit(self.name, model)
 
         try:
             response = self._client.models.generate_content(
@@ -258,10 +333,21 @@ class GoogleAdapter:
             if code in (401, 403):
                 raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
             if code == 404:
+                if cache_name is not None:
+                    # The cache expired / was deleted server-side mid-scan.
+                    # Drop it and retry ONCE with caching disabled for this
+                    # call, rather than failing the whole request over a
+                    # stale cache reference (use_cache=False guarantees
+                    # this doesn't loop — no second cache-create attempt).
+                    self._invalidate_cache(cache_key)
+                    return self._complete_once(
+                        model=model, system=system, messages=messages,
+                        max_tokens=max_tokens, tools=tools, use_cache=False,
+                    )
                 raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
             if code == 429:
                 retry_after = _retry_after_from(exc)
-                report_rate_limit(retry_after)
+                report_rate_limit(self.name, retry_after)
                 raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except genai_errors.ServerError as exc:
@@ -272,6 +358,48 @@ class GoogleAdapter:
             raise LLMConnectionError(redact_secrets(str(exc))) from redacted_cause_from(exc)
 
         return _response_to_unified(response)
+
+    # ------------------------------------------------------------------
+    # Context caching (opt-in — see module docstring)
+    # ------------------------------------------------------------------
+
+    def _get_or_create_cache(
+        self,
+        model: str,
+        system: str,
+        tools: Optional[list[ToolDef]],
+        cache_key: str,
+    ) -> Optional[str]:
+        with self._cache_lock:
+            cached = self._caches.get(cache_key)
+        if cached is not None:
+            return cached
+
+        config_kwargs: dict[str, Any] = {"system_instruction": system, "ttl": "3600s"}
+        if tools:
+            config_kwargs["tools"] = [_tool_to_gemini(t) for t in tools]
+        try:
+            cache = self._client.caches.create(
+                model=model,
+                config=genai_types.CreateCachedContentConfig(**config_kwargs),
+            )
+        except Exception:
+            # Caching is a pure optimisation. Gemini enforces a
+            # per-model-generation minimum token count we don't hard-code
+            # here (see module docstring) — a too-small system prompt,
+            # an unsupported model, or a transient error all land here.
+            # Never let this break the actual completion call.
+            return None
+
+        with self._cache_lock:
+            self._caches[cache_key] = cache.name
+        return cache.name
+
+    def _invalidate_cache(self, cache_key: Optional[str]) -> None:
+        if cache_key is None:
+            return
+        with self._cache_lock:
+            self._caches.pop(cache_key, None)
 
     def validate(self, model: str) -> None:
         try:
@@ -361,6 +489,16 @@ def _name_for_tool_result(block: ToolResultBlock) -> str:
     non-empty string rather than ``None``.
     """
     return block.name or block.tool_use_id or "tool_response"
+
+
+def _cache_key(model: str, system: str, tools: Optional[list[ToolDef]]) -> str:
+    """Stable key for the (model, system, tools) prefix a cache covers."""
+    tools_repr = json.dumps(
+        [{"name": t.name, "description": t.description, "input_schema": t.input_schema} for t in tools or []],
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(f"{model}\0{system}\0{tools_repr}".encode("utf-8")).hexdigest()
+    return digest
 
 
 def _tool_to_gemini(tool: ToolDef) -> genai_types.Tool:

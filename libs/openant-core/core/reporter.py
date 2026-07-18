@@ -586,6 +586,7 @@ def generate_disclosure_docs(
     from report.schema import validate_pipeline_output, ValidationError
     from utilities.llm import (
         build_phase_registry,
+        effective_worker_count,
         load_config_file,
         probe_registry_or_raise,
         resolve_llm_config,
@@ -634,7 +635,11 @@ def generate_disclosure_docs(
     if not confirmed:
         print("  No confirmed vulnerabilities to generate disclosures for.", file=sys.stderr)
     else:
-        print(f"  Generating {len(confirmed)} disclosures in parallel (8 workers)...",
+        # Don't spin up more concurrent workers than this phase's model
+        # can usefully serve per minute. No-op unless the binding has a
+        # configured rpm_limit.
+        disclosure_workers = effective_worker_count(report_binding, 8)
+        print(f"  Generating {len(confirmed)} disclosures in parallel ({disclosure_workers} workers)...",
               file=sys.stderr)
 
         def _one(args):
@@ -647,7 +652,7 @@ def generate_disclosure_docs(
                 f.write(disclosure_text)
             return finding["short_name"], filepath, usage
 
-        executor = ThreadPoolExecutor(max_workers=8)
+        executor = ThreadPoolExecutor(max_workers=disclosure_workers)
         futures = {executor.submit(_one, item): item for item in confirmed}
         try:
             for future in as_completed(futures):

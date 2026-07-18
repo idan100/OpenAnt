@@ -31,6 +31,7 @@ from utilities.llm import (
     PhaseBinding,
     PhaseRegistry,
     build_phase_registry,
+    effective_worker_count,
     load_config_file,
     resolve_llm_config,
 )
@@ -203,6 +204,10 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
     """
     total = len(units)
     tracker = get_global_tracker()
+    # Don't spin up more concurrent workers than this phase's model can
+    # usefully serve per minute — see utilities/llm/helpers.py. No-op
+    # unless the binding has a configured rpm_limit.
+    workers = effective_worker_count(binding, workers)
 
     # Load checkpoint state
     checkpointed = {}

@@ -198,7 +198,7 @@ def test_rate_limit_reports_to_global_limiter():
         )
 
     adapter, _ = _stub(boom)
-    limiter = get_rate_limiter()
+    limiter = get_rate_limiter("openai")
     assert not limiter.is_in_backoff()
     with pytest.raises(LLMRateLimitError):
         adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8)
@@ -208,7 +208,7 @@ def test_rate_limit_reports_to_global_limiter():
 def test_complete_consults_limiter_before_request(monkeypatch):
     adapter, _ = _stub(lambda **kw: _text_response())
     seen = {"waited": False}
-    limiter = get_rate_limiter()
+    limiter = get_rate_limiter("openai")
     monkeypatch.setattr(
         limiter, "wait_if_needed", lambda: (seen.__setitem__("waited", True), 0.0)[1]
     )

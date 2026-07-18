@@ -401,7 +401,7 @@ class TestRateLimiterCoordination:
         # The singleton should now be in backoff so other workers
         # wait their turn — that's the whole point of routing 429s
         # through ``get_rate_limiter().report_rate_limit()``.
-        assert get_rate_limiter().is_in_backoff()
+        assert get_rate_limiter("anthropic").is_in_backoff()
 
     def test_529_overloaded_maps_to_rate_limit(self):
         # Per the design decision in plan §10, 529 is transient just
@@ -422,7 +422,7 @@ class TestRateLimiterCoordination:
                 max_tokens=8,
             )
         assert exc_info.value.retry_after == 5
-        assert get_rate_limiter().is_in_backoff()
+        assert get_rate_limiter("anthropic").is_in_backoff()
 
     def test_other_api_status_errors_are_response_errors(self):
         # 400/422/500 are structural problems, not rate-limit problems.
@@ -442,7 +442,7 @@ class TestRateLimiterCoordination:
                 max_tokens=8,
             )
         # And critically, no rate-limit backoff was triggered.
-        assert not get_rate_limiter().is_in_backoff()
+        assert not get_rate_limiter("anthropic").is_in_backoff()
 
 
 # ---------------------------------------------------------------------------

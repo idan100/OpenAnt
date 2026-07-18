@@ -151,6 +151,56 @@ The wizard writes `~/.config/openant/config.json` for you, but you can edit it d
 
 Providers accept a custom `base_url` for OpenAI-compatible / Anthropic-compatible proxies (OpenRouter, vLLM, Bedrock, internal gateways). The `openant-default` config (Claude across all phases) is built in and always available regardless of file contents.
 
+#### Provider failover
+
+Any llm-config can name another llm-config as its `fallback`:
+
+```json
+"llm_configs": {
+  "my-llm": {
+    "fallback": "my-backup-llm",
+    "app_context": {"provider": "anthropic", "model": "claude-sonnet-5"}
+    /* ...plus the remaining six phases, same as any llm-config */
+  },
+  "my-backup-llm": {
+    "app_context": {"provider": "google", "model": "gemini-flash-latest"}
+    /* ...plus the remaining six phases */
+  }
+}
+```
+
+(JSON has no comments — the `/* ... */` lines above are just this doc's shorthand for "the rest of the seven phases go here as usual"; a real config.json needs every phase spelled out.) If a phase's provider signals a hard usage-cap exhaustion mid-scan (a subscription's session limit, a metered account's exhausted budget) rather than an ordinary transient rate limit, OpenAnt permanently switches that provider to the fallback for the rest of the run — no restart, no manual intervention. Every phase sharing a primary provider shares one exhaustion signal, so the moment any one of them discovers the cap, the rest switch immediately instead of each independently hitting the same wall. The fallback is also probed at scan startup alongside the primary, so a broken fallback is caught right away instead of mid-scan when you actually need it. Only one level deep — a fallback's own `fallback` field, if it has one, is ignored.
+
+#### RPM pacing for tight rate limits
+
+A phase's `{provider, model}` entry can carry an optional `rpm_limit`:
+
+```json
+"analyze": {"provider": "google", "model": "gemini-3.1-flash-lite", "rpm_limit": 14}
+```
+
+When set, OpenAnt paces requests to stay under that ceiling proactively instead of firing workers in parallel and reacting to 429s after the fact — useful for tightly-quota'd free-tier keys, where a single provider can span several models with very different limits (pace each independently rather than sharing one number across all of them). That phase's worker-pool size is also automatically capped to the same ceiling, so OpenAnt doesn't spin up more concurrent threads than the model can actually serve. Omit it (the default) for providers without a known fixed ceiling — current reactive-backoff-only behavior, unchanged.
+
+#### Round-robin pooling across multiple providers
+
+A phase's `{provider, model}` entry can carry an optional `pool` — additional `{provider, model}` candidates to actively round-robin alongside the primary:
+
+```json
+"analyze": {
+  "provider": "anthropic", "model": "claude-sonnet-5",
+  "pool": [
+    {"provider": "google", "model": "gemini-3.1-flash-lite", "rpm_limit": 14},
+    {"provider": "groq", "model": "llama-3.3-70b-versatile", "rpm_limit": 28}
+  ]
+}
+```
+
+This is different from `fallback`: failover is sequential and reactive (use the primary until it's exhausted, THEN switch to one backup); a pool is concurrent and proactive — every call rotates to the next candidate, so a phase draws on several SEPARATE quota pools *at once* instead of treating the extras as pure backup. Useful when the goal is maximum aggregate throughput across a metered/subscription provider plus several free-tier API keys, not just resilience.
+
+Each call starts from the next candidate in rotation, preferring one with no known reason to block (not currently rate-limited, has an open `rpm_limit` slot) over one that's busy — a busy candidate is only used as a last resort, when every candidate in the pool is busy. Pool members reuse the same adapter instance wherever else they're referenced (e.g. a provider used as another phase's plain primary), and get validated at scan startup alongside everything else — leniently: a pool member that's transiently down doesn't block startup as long as at least one candidate in the pool works, since the pool naturally routes around a bad member at call time anyway. A tool-calling phase (`enhance`/`verify`) requires every pool member to support tool calling, checked once at startup.
+
+Pooling and `fallback` compose: a phase's primary side can itself be a pool, and the whole pool can still fail over to a configured fallback config if literally every candidate in it is exhausted at once.
+
 #### Adding a new provider adapter
 
 OpenAnt's adapter layer is a small Python recipe — one Python file implementing the `LLMAdapter` Protocol, one factory for the contract-test harness, plus a registry entry — and that alone is enough to run the adapter from a hand-authored config. To also have it offered by the `openant setup llm` wizard and pass its pre-save probe, add a few Go touch-points in `apps/openant-cli/cmd/setup.go` (the supported-provider list, a probe `case`, the per-phase default-model maps) plus a Go probe function. The 12 contract tests run automatically against your adapter once it's wired in. See [`docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md`](docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md) for the full recipe.

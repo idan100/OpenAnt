@@ -21,6 +21,26 @@ from .adapter import Message, TextBlock
 from .registry import PhaseBinding
 
 
+def effective_worker_count(binding: PhaseBinding, requested: int) -> int:
+    """Cap a phase's ThreadPoolExecutor size to its configured RPM ceiling.
+
+    Spinning up more concurrent workers than a model can actually serve
+    per minute doesn't buy more throughput — the extra workers just sit
+    blocked on the adapter's RpmPacer (see ``utilities/rate_limiter.py``)
+    — but it does cost thread/connection overhead and makes the pacer's
+    queueing less predictable under more contention than necessary.
+
+    No configured ``rpm_limit`` (the common case today — Anthropic,
+    OpenAI, claude_subscription) leaves ``requested`` untouched; this
+    only kicks in for phases explicitly configured with a known tight
+    ceiling (e.g. a Gemini free-tier model in the ``gemini`` example
+    config).
+    """
+    if binding.rpm_limit is None:
+        return requested
+    return max(1, min(requested, round(binding.rpm_limit)))
+
+
 def lookup_pricing(binding: PhaseBinding) -> Optional[dict]:
     """Return the adapter's price entry for ``binding.model``, or None.
 

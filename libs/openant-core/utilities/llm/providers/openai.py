@@ -181,6 +181,7 @@ class OpenAIAdapter:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         max_retries: int = 5,
+        name: Optional[str] = None,
         _client: Optional[openai.OpenAI] = None,
     ):
         """Construct the adapter.
@@ -190,12 +191,26 @@ class OpenAIAdapter:
                 ``OPENAI_API_KEY`` from the environment.
             base_url: Override the API host. ``None`` means the SDK's
                 default (api.openai.com). Set this for
-                OpenAI-compatible proxies (LiteLLM, vLLM, etc.).
+                OpenAI-compatible proxies (LiteLLM, vLLM, OpenRouter,
+                Groq, Cerebras, DeepInfra, etc.).
             max_retries: Forwarded to the SDK. The SDK retries
                 transient 429s and 5xx automatically; the pipeline
                 does not add its own retry loop on top.
+            name: Overrides the class-level ``"openai"`` identity used
+                for rate-limit/RPM-pacer keying (see ``_ratelimit.py``).
+                Set this to the config's provider NAME (e.g.
+                ``"groq"``, ``"openrouter"``) whenever more than one
+                OpenAI-compatible vendor is configured at once —
+                without it, every such vendor shares the same
+                ``"openai"`` rate-limit bucket, so a 429 on one
+                incorrectly throttles the others too. ``build_adapter``
+                passes this automatically; only matters if you're
+                constructing the adapter directly.
             _client: Injected SDK instance for testing.
         """
+        if name is not None:
+            self.name = name
+
         if _client is not None:
             self._client = _client
             return
@@ -229,7 +244,7 @@ class OpenAIAdapter:
             request["tools"] = [_tool_to_openai(t) for t in tools]
 
         # Cooperate with cross-worker backoff before issuing the call.
-        wait_for_rate_limit()
+        wait_for_rate_limit(self.name, model)
 
         try:
             response = self._client.chat.completions.create(**request)
@@ -239,7 +254,7 @@ class OpenAIAdapter:
             raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except openai.RateLimitError as exc:
             retry_after = _retry_after_from(exc)
-            report_rate_limit(retry_after)
+            report_rate_limit(self.name, retry_after)
             raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
         except openai.NotFoundError as exc:
             raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
