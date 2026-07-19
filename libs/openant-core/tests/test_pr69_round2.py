@@ -101,12 +101,20 @@ class _TruncatingAdapter:
         )
 
 
-def test_verifier_incomplete_on_truncation_makes_no_extra_call():
+def test_verifier_incomplete_on_truncation_makes_bounded_extra_call():
     stub = _TruncatingAdapter()
     binding = PhaseBinding(phase="verify", adapter=stub, model="claude-x", provider_name="anthropic")
     verifier = FindingVerifier(index=RepositoryIndex({}, repo_path=None), binding=binding)
 
     result = verifier.verify_result(code="x = 1", finding="sqli", attack_vector="a", reasoning="r")
 
-    assert stub.calls == 1, "must NOT loop with an empty user message after a truncated response"
+    # Must NOT loop indefinitely (the original M-c bug) — but a bounded,
+    # multi-attempt "force a final verdict" recovery IS now expected
+    # before giving up (see _force_final_verdict, MAX_RECOVERY_ATTEMPTS=3):
+    # call 1 is the normal truncated turn; each of the 3 recovery attempts
+    # makes its own call (same stub, same truncated text back) PLUS its own
+    # JSONCorrector fallback attempt when _try_parse_text_response fails to
+    # parse it — 1 + 3*(1+1) = 7. Still fully bounded, not the unbounded
+    # loop M-c fixed.
+    assert stub.calls == 7, "must be bounded (1 normal + 3*(1 recovery + 1 JSON-correction)), not looping"
     assert "incomplete" in result.explanation.lower()

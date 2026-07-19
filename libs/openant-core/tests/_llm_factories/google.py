@@ -36,9 +36,9 @@ def _text_part(text: str) -> SimpleNamespace:
     return SimpleNamespace(text=text, function_call=None)
 
 
-def _function_call_part(*, name: str, args: dict, id: str | None = None) -> SimpleNamespace:
+def _function_call_part(*, name: str, args: dict, id: str | None = None, thought_signature: bytes | None = None) -> SimpleNamespace:
     fc = SimpleNamespace(name=name, args=args, id=id)
-    return SimpleNamespace(text=None, function_call=fc)
+    return SimpleNamespace(text=None, function_call=fc, thought_signature=thought_signature)
 
 
 def _content(parts: list) -> SimpleNamespace:

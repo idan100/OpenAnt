@@ -23,6 +23,31 @@ Composes with failover: a phase's PRIMARY side can itself be a pool
 and the whole pool can still fail over to a configured fallback config
 if literally every candidate in it is exhausted at once — see
 ``registry.build_phase_registry`` for how the two wrap each other.
+
+Sticky within one multi-turn conversation. Tool-calling phases
+(``enhance``, ``verify``) call ``complete()`` once per TURN of the same
+back-and-forth, replaying the full ``messages`` history (including
+earlier assistant turns' tool_use blocks) on every call. Rotating the
+candidate on every one of those calls means turn 2 can land on a
+DIFFERENT provider than turn 1 — which then has to replay a tool call
+it never made itself. For Gemini specifically this is a hard 400
+("Function call is missing a thought_signature"): the signature is
+provider-specific and only exists for the provider that actually made
+the call. Other providers likely have their own, less loudly-visible
+failure modes replaying another provider's tool_use history.
+
+Fixed by keying the rotation on conversation identity rather than call
+count: a call whose ``messages`` already contains an assistant turn is
+a CONTINUATION (reuse whatever candidate handled turn 1), not a fresh
+pick. Each ThreadPoolExecutor worker processes one unit's conversation
+to completion, synchronously, before picking up the next — so a
+``threading.local`` pin is exactly conversation-scoped: the next unit's
+first call always starts with a single fresh user message (no
+assistant turn yet), which naturally reads as "new conversation" and
+advances the rotation again. Single-shot phases (analyze, app_context,
+report, ...) never carry an assistant turn either, so they round-robin
+on every call exactly as before — this only changes behavior for
+actual multi-turn tool loops.
 """
 
 from __future__ import annotations
@@ -53,6 +78,10 @@ class PoolAdapter:
         self._phase = phase
         self._lock = threading.Lock()
         self._next_index = 0
+        # Per-thread pin so a multi-turn tool-calling conversation stays
+        # on the SAME candidate across turns — see the module docstring's
+        # "Sticky within one multi-turn conversation" section.
+        self._sticky = threading.local()
 
     # ------------------------------------------------------------------
     # LLMAdapter protocol
@@ -90,31 +119,52 @@ class PoolAdapter:
             return idx
 
     def complete(self, *, model: str, **kwargs):  # noqa: ARG002 - see class docstring
+        messages = kwargs.get("messages") or []
+        is_continuation = any(getattr(m, "role", None) == "assistant" for m in messages)
+        pinned_index = getattr(self._sticky, "index", None)
+
+        if is_continuation and pinned_index is not None:
+            # Mid-conversation: stay on the pinned candidate even if
+            # it's currently rate-limited (it'll just block on its own
+            # pacer/backoff) — falling through to a different provider
+            # here would replay this provider's tool-call history
+            # against one that never made those calls. See the module
+            # docstring's "Sticky within one multi-turn conversation".
+            adapter, candidate_model, provider_name = self._candidates[pinned_index]
+            sys.stderr.write(f"[pool:{self._phase}] -> {provider_name}/{candidate_model} (sticky)\n")
+            return adapter.complete(model=candidate_model, **kwargs)
+
         start = self._rotate_start()
         n = len(self._candidates)
 
-        ready: list[tuple[LLMAdapter, str, str]] = []
-        busy: list[tuple[LLMAdapter, str, str]] = []
+        ready: list[tuple[int, LLMAdapter, str, str]] = []
+        busy: list[tuple[int, LLMAdapter, str, str]] = []
         for offset in range(n):
-            adapter, candidate_model, provider_name = self._candidates[(start + offset) % n]
+            idx = (start + offset) % n
+            adapter, candidate_model, provider_name = self._candidates[idx]
             if get_rate_limiter(provider_name).is_in_backoff():
-                busy.append((adapter, candidate_model, provider_name))
+                busy.append((idx, adapter, candidate_model, provider_name))
                 continue
             pacer = get_rpm_pacer(provider_name, candidate_model)
             if pacer is not None and not pacer.has_immediate_slot():
-                busy.append((adapter, candidate_model, provider_name))
+                busy.append((idx, adapter, candidate_model, provider_name))
                 continue
-            ready.append((adapter, candidate_model, provider_name))
+            ready.append((idx, adapter, candidate_model, provider_name))
 
         # Try candidates with no known reason to block first, in
         # rotation order; only fall through to a busy one (which will
         # then block on ITS OWN pacer/backoff) if every candidate is
         # currently busy — "just wait" is still better than erroring.
         last_exc: Optional[LLMRateLimitError] = None
-        for adapter, candidate_model, provider_name in ready + busy:
+        for idx, adapter, candidate_model, provider_name in ready + busy:
             sys.stderr.write(f"[pool:{self._phase}] -> {provider_name}/{candidate_model}\n")
             try:
-                return adapter.complete(model=candidate_model, **kwargs)
+                result = adapter.complete(model=candidate_model, **kwargs)
+                # Pin so any FOLLOW-UP turn of this same conversation
+                # (this thread processes one unit's conversation to
+                # completion before picking up the next) stays here.
+                self._sticky.index = idx
+                return result
             except LLMRateLimitError as exc:
                 last_exc = exc
                 sys.stderr.write(

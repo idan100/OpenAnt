@@ -74,11 +74,20 @@ class ToolUseBlock:
             equals this value.
         name: Tool name as advertised in :class:`ToolDef`.
         input: Tool arguments, already JSON-deserialised into a dict.
+        thought_signature: Opaque provider token, round-tripped
+            verbatim and otherwise ignored by the pipeline. Gemini's
+            "thinking" models (2.5+/3.x) attach one to every
+            function_call part and REJECT the call with a 400 if a
+            replayed function_call in a later turn is missing it —
+            see the Google adapter's translation functions. ``None``
+            for every other provider; callers that never set this
+            keep working unchanged.
     """
 
     id: str
     name: str
     input: dict[str, Any]
+    thought_signature: Optional[bytes] = None
 
 
 @dataclass(frozen=True)

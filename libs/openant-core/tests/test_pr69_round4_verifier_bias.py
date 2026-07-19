@@ -197,19 +197,36 @@ def test_failsafe_unparseable_text_does_not_auto_agree():
 
 
 def test_failsafe_no_tool_calls_does_not_auto_agree():
-    """:448 — truncated response with no tool call must not rubber-stamp."""
+    """:448 — truncated response with no tool call must not rubber-stamp.
+
+    Must not loop with an empty user message (the original bug) — but
+    bounded, multi-attempt "force a final verdict" recovery IS now
+    expected before giving up (see _force_final_verdict,
+    MAX_RECOVERY_ATTEMPTS=3): call 1 is the normal truncated turn; each
+    of the 3 recovery attempts makes its own call PLUS its own
+    JSONCorrector fallback attempt (same stub, same truncated text
+    every time) — 1 + 3*(1+1) = 7. Still fully bounded.
+    """
     adapter = _NoToolCallsAdapter()
     result = _verify(adapter)
-    assert adapter.calls == 1, "must not loop with an empty user message"
+    assert adapter.calls == 7, "must be bounded (1 normal + 3*(1 recovery + 1 JSON-correction))"
     assert "incomplete" in result.explanation.lower()
     _assert_failsafe(result)
 
 
 def test_failsafe_max_iterations_does_not_auto_agree():
-    """:464 — hitting MAX_ITERATIONS must not rubber-stamp Stage 1."""
+    """:464 — hitting MAX_ITERATIONS must not rubber-stamp Stage 1.
+
+    MAX_ITERATIONS normal calls, plus up to MAX_RECOVERY_ATTEMPTS=3
+    bounded forced-final-verdict recovery calls (see
+    _force_final_verdict) before giving up — each restricts tools to
+    `finish` only, but this stub ignores the offered tools and keeps
+    returning a non-finish tool call every time, so all 3 attempts
+    correctly fail and the loop terminates rather than looping forever.
+    """
     adapter = _MaxIterationsAdapter()
     result = _verify(adapter)
-    assert adapter.calls == MAX_ITERATIONS
+    assert adapter.calls == MAX_ITERATIONS + 3, "must be bounded: MAX_ITERATIONS + exactly 3 forced-recovery attempts"
     assert "max iterations" in result.explanation.lower()
     _assert_failsafe(result)
 

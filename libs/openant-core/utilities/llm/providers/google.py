@@ -449,10 +449,17 @@ def _message_to_gemini(message: Message) -> genai_types.Content:
         if isinstance(block, TextBlock):
             parts.append(genai_types.Part.from_text(text=block.text))
         elif isinstance(block, ToolUseBlock):
-            parts.append(genai_types.Part.from_function_call(
+            part = genai_types.Part.from_function_call(
                 name=block.name,
                 args=block.input or {},
-            ))
+            )
+            # Thinking models (2.5+/3.x) require this on replay — see
+            # ToolUseBlock.thought_signature's docstring. Only set when
+            # we actually captured one (e.g. a ToolUseBlock built by
+            # hand, or by another provider, won't have it).
+            if block.thought_signature is not None:
+                part.thought_signature = block.thought_signature
+            parts.append(part)
         elif isinstance(block, ToolResultBlock):
             # Gemini's function_response keys on the function NAME, not
             # the original call's id. The pipeline carries that name on
@@ -506,9 +513,40 @@ def _tool_to_gemini(tool: ToolDef) -> genai_types.Tool:
         genai_types.FunctionDeclaration(
             name=tool.name,
             description=tool.description,
-            parameters=tool.input_schema,
+            parameters=_sanitize_schema_for_gemini(tool.input_schema),
         ),
     ])
+
+
+def _sanitize_schema_for_gemini(schema: Any) -> Any:
+    """Recursively translate JSON Schema shapes Gemini's stricter
+    ``Schema`` type rejects.
+
+    Handles the one shape our ToolDefs actually use: a nullable field
+    written the standard JSON Schema (2020-12) way, ``"type": ["string",
+    "null"]``, rather than Gemini's own ``type: STRING, nullable: true``.
+    Gemini's ``Schema.type`` only accepts a single scalar value — passing
+    a list fails ``FunctionDeclaration`` construction outright (a local
+    pydantic ``ValidationError``, before any request is even sent), which
+    previously took down 100% of tool calls for any tool whose schema
+    used this pattern (e.g. ``FindingVerifier``'s ``finish`` tool).
+    """
+    if isinstance(schema, dict):
+        schema = dict(schema)  # don't mutate the caller's ToolDef schema
+        type_val = schema.get("type")
+        if isinstance(type_val, list):
+            non_null = [t for t in type_val if t != "null"]
+            if "null" in type_val:
+                schema["nullable"] = True
+            schema["type"] = non_null[0] if non_null else "string"
+        if isinstance(schema.get("properties"), dict):
+            schema["properties"] = {
+                k: _sanitize_schema_for_gemini(v) for k, v in schema["properties"].items()
+            }
+        if "items" in schema:
+            schema["items"] = _sanitize_schema_for_gemini(schema["items"])
+        return schema
+    return schema
 
 
 def _response_to_unified(response: Any) -> CompletionResult:
@@ -542,6 +580,12 @@ def _response_to_unified(response: Any) -> CompletionResult:
                     id=fc_id,
                     name=fc.name,
                     input=dict(args) if args else {},
+                    # Thinking models attach this to the PART carrying
+                    # the function_call, not to the FunctionCall object
+                    # itself — must be replayed verbatim on the next
+                    # turn or Gemini 400s with "Function call is
+                    # missing a thought_signature".
+                    thought_signature=getattr(part, "thought_signature", None),
                 ))
                 continue
             text = getattr(part, "text", None)

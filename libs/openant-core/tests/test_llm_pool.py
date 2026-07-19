@@ -14,10 +14,12 @@ from utilities.llm import (
     ConfigFile,
     LLMConfig,
     LLMRateLimitError,
+    Message,
     PhaseRef,
     PoolMember,
     ProviderConfig,
     TextBlock,
+    ToolUseBlock,
     build_phase_registry,
     empty_config,
     with_provider,
@@ -150,6 +152,80 @@ class TestPoolAdapter:
             a.fail_with = LLMRateLimitError("busy", retry_after=5)
         with pytest.raises(LLMRateLimitError):
             pool.complete(model="x", system=None, messages=[], max_tokens=8)
+
+    # -----------------------------------------------------------------
+    # Sticky-per-conversation: a multi-turn tool-calling loop must stay
+    # on the SAME candidate across turns, not round-robin per call —
+    # see the module docstring. A "continuation" call is detected by
+    # the presence of an assistant-role message in `messages`.
+    # -----------------------------------------------------------------
+
+    _FIRST_TURN = [Message(role="user", content=[TextBlock("hi")])]
+
+    def _second_turn(self, tool_name="search"):
+        return self._FIRST_TURN + [
+            Message(role="assistant", content=[ToolUseBlock(id="t1", name=tool_name, input={})]),
+            Message(role="user", content=[TextBlock("tool result")]),
+        ]
+
+    def test_continuation_call_stays_on_pinned_candidate(self):
+        pool, adapters = self._pool(3)
+        first = pool.complete(model="x", system=None, messages=self._FIRST_TURN, max_tokens=8)
+        pinned_vendor = first.content[0].text  # e.g. "from-vendor0"
+
+        # Without the fix, the next call would round-robin to vendor1 —
+        # a different provider being asked to replay vendor0's tool call.
+        second = pool.complete(model="x", system=None, messages=self._second_turn(), max_tokens=8)
+        assert second.content[0].text == pinned_vendor
+
+        third = pool.complete(model="x", system=None, messages=self._second_turn(), max_tokens=8)
+        assert third.content[0].text == pinned_vendor
+
+    def test_fresh_conversation_after_a_completed_one_advances_rotation(self):
+        pool, adapters = self._pool(3)
+        pool._next_index = 0
+        first_conv = pool.complete(model="x", system=None, messages=self._FIRST_TURN, max_tokens=8)
+        pool.complete(model="x", system=None, messages=self._second_turn(), max_tokens=8)  # continuation, stays pinned
+
+        # A NEW conversation (fresh, no assistant turn yet) must advance
+        # past whatever candidate served the previous conversation.
+        second_conv = pool.complete(model="x", system=None, messages=self._FIRST_TURN, max_tokens=8)
+        assert second_conv.content[0].text != first_conv.content[0].text
+
+    def test_continuation_ignores_which_candidate_rotation_would_currently_point_at(self):
+        pool, adapters = self._pool(3)
+        pool._next_index = 0
+        first = pool.complete(model="x", system=None, messages=self._FIRST_TURN, max_tokens=8)
+        pinned_vendor = first.content[0].text
+        # Simulate other conversations having advanced the shared rotation
+        # index in between (e.g. sibling worker threads on other units).
+        pool._next_index = 2
+        second = pool.complete(model="x", system=None, messages=self._second_turn(), max_tokens=8)
+        assert second.content[0].text == pinned_vendor
+
+    def test_sticky_pin_is_per_thread(self):
+        import threading
+
+        pool, adapters = self._pool(3)
+        pool._next_index = 0
+        results = {}
+
+        def worker(key):
+            first = pool.complete(model="x", system=None, messages=self._FIRST_TURN, max_tokens=8)
+            second = pool.complete(model="x", system=None, messages=self._second_turn(), max_tokens=8)
+            results[key] = (first.content[0].text, second.content[0].text)
+
+        t1 = threading.Thread(target=worker, args=("a",))
+        t1.start()
+        t1.join()
+        t2 = threading.Thread(target=worker, args=("b",))
+        t2.start()
+        t2.join()
+
+        # Each thread's own continuation call stayed pinned to ITS OWN
+        # first-turn candidate, independent of the other thread.
+        assert results["a"][0] == results["a"][1]
+        assert results["b"][0] == results["b"][1]
 
     def test_supports_tools_requires_all_members(self):
         good = _FakeAdapter("a")

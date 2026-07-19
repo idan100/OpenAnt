@@ -591,6 +591,20 @@ def run_analysis(
     # Compute verdict counts from results
     counts = _count_verdicts(results)
 
+    # --- Inconclusive Resolution ---
+    if counts.get("inconclusive"):
+        try:
+            from utilities.agentic_enhancer.repository_index import load_index_from_file
+            from utilities.stage1_inconclusive_resolver import resolve_inconclusive_findings
+            index = load_index_from_file(analyzer_output_path, repo_path) if analyzer_output_path else None
+            if index is not None:
+                results = resolve_inconclusive_findings(results, code_by_route, binding, index, json_corrector, app_context)
+                counts = _count_verdicts(results)
+        except ImportError:
+            print("[Analyze] Inconclusive resolver not available, skipping.", file=sys.stderr)
+        except Exception as e:
+            print(f"[Analyze] Inconclusive resolution error (non-fatal): {e}", file=sys.stderr)
+
     # --- Stage 1 Consistency Check ---
     consistency_corrections = 0
     try:

@@ -12,8 +12,14 @@ from __future__ import annotations
 
 import pytest
 
-from utilities.llm import LLMRateLimitError, Message, TextBlock, ToolResultBlock
-from utilities.llm.providers.google import _message_to_gemini, _name_for_tool_result
+from utilities.llm import LLMRateLimitError, Message, TextBlock, ToolDef, ToolResultBlock, ToolUseBlock
+from utilities.llm.providers.google import (
+    _message_to_gemini,
+    _name_for_tool_result,
+    _response_to_unified,
+    _sanitize_schema_for_gemini,
+    _tool_to_gemini,
+)
 from utilities.llm_client import reset_warning_state
 from utilities.rate_limiter import get_rate_limiter, reset_rate_limiter
 
@@ -63,6 +69,133 @@ def test_function_response_carries_function_name():
         "C1: Gemini matches function_response to function_call by NAME; "
         "sending the synthesised id would never match the original call"
     )
+
+
+# ---------------------------------------------------------------------------
+# thought_signature — required on replay by Gemini's thinking models
+# (2.5+/3.x), or the second turn 400s with "Function call is missing a
+# thought_signature". Missed originally because the SDK attaches this
+# to the PART carrying the function_call, not to the FunctionCall
+# object nested inside it.
+# ---------------------------------------------------------------------------
+
+
+def test_response_to_unified_captures_thought_signature():
+    from tests._llm_factories.google import _candidate, _function_call_part, _response
+
+    response = _response(
+        candidates=[_candidate(
+            parts=[_function_call_part(
+                name="echo", args={"text": "hi"}, id="gemini_echo_0",
+                thought_signature=b"sig-bytes-123",
+            )],
+        )],
+        prompt_tokens=10, candidate_tokens=8,
+    )
+    result = _response_to_unified(response)
+    tool_use = result.content[0]
+    assert isinstance(tool_use, ToolUseBlock)
+    assert tool_use.thought_signature == b"sig-bytes-123"
+
+
+def test_response_to_unified_tolerates_missing_thought_signature():
+    """A function_call part with no thought_signature attribute at all
+    (older SDK behavior, or a non-thinking model) must not crash."""
+    from types import SimpleNamespace
+    from tests._llm_factories.google import _candidate, _response
+
+    fc = SimpleNamespace(name="echo", args={"text": "hi"}, id="gemini_echo_0")
+    part = SimpleNamespace(text=None, function_call=fc)  # no .thought_signature at all
+    response = _response(candidates=[_candidate(parts=[part])], prompt_tokens=10, candidate_tokens=8)
+    result = _response_to_unified(response)
+    assert result.content[0].thought_signature is None
+
+
+def test_message_to_gemini_replays_thought_signature_on_the_part():
+    """The actual bug: the signature must land on the outgoing Part
+    (Part.from_function_call doesn't accept it as a kwarg), not get
+    silently dropped on replay."""
+    msg = Message(
+        role="assistant",
+        content=[ToolUseBlock(
+            id="gemini_echo_0", name="echo", input={"text": "hi"},
+            thought_signature=b"sig-bytes-123",
+        )],
+    )
+    content = _message_to_gemini(msg)
+    assert content.parts[0].thought_signature == b"sig-bytes-123"
+
+
+def test_message_to_gemini_omits_thought_signature_when_absent():
+    """A ToolUseBlock from a non-Gemini origin (or built by hand in a
+    test) has no signature — must not send a bogus one."""
+    msg = Message(
+        role="assistant",
+        content=[ToolUseBlock(id="t_1", name="echo", input={"text": "hi"})],
+    )
+    content = _message_to_gemini(msg)
+    assert content.parts[0].thought_signature is None
+
+
+# ---------------------------------------------------------------------------
+# Nullable-union tool schema fields ("type": ["string", "null"], valid
+# JSON Schema 2020-12) previously crashed FunctionDeclaration construction
+# outright for ANY tool using this pattern — e.g. FindingVerifier's
+# ``finish`` tool (exploit_path.entry_point, .path_broken_at,
+# security_weakness). Gemini's Schema.type only accepts a single scalar.
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_schema_converts_nullable_union_to_nullable_flag():
+    schema = {"type": ["string", "null"], "description": "x"}
+    result = _sanitize_schema_for_gemini(schema)
+    assert result["type"] == "string"
+    assert result["nullable"] is True
+
+
+def test_sanitize_schema_recurses_into_properties_and_items():
+    schema = {
+        "type": "object",
+        "properties": {
+            "entry_point": {"type": ["string", "null"]},
+            "data_flow": {"type": "array", "items": {"type": ["string", "null"]}},
+            "sink_reached": {"type": "boolean"},
+        },
+    }
+    result = _sanitize_schema_for_gemini(schema)
+    assert result["properties"]["entry_point"]["type"] == "string"
+    assert result["properties"]["entry_point"]["nullable"] is True
+    assert result["properties"]["data_flow"]["items"]["type"] == "string"
+    assert result["properties"]["data_flow"]["items"]["nullable"] is True
+    assert result["properties"]["sink_reached"]["type"] == "boolean"
+    assert "nullable" not in result["properties"]["sink_reached"]
+
+
+def test_sanitize_schema_leaves_ordinary_schemas_untouched():
+    schema = {"type": "string", "enum": ["a", "b"]}
+    assert _sanitize_schema_for_gemini(schema) == schema
+
+
+def test_sanitize_schema_does_not_mutate_input():
+    schema = {"type": ["string", "null"]}
+    _sanitize_schema_for_gemini(schema)
+    assert schema == {"type": ["string", "null"]}, "must not mutate the caller's ToolDef schema"
+
+
+def test_tool_to_gemini_builds_finding_verifier_finish_tool_without_crashing():
+    """Reproduces the exact real-world crash: FindingVerifier's ``finish``
+    tool schema, which is what actually broke every Stage 2 Gemini call."""
+    from utilities.finding_verifier import VERIFICATION_TOOLS
+
+    finish = next(t for t in VERIFICATION_TOOLS if t["name"] == "finish")
+    tool = ToolDef(name=finish["name"], description=finish.get("description", ""), input_schema=finish["input_schema"])
+
+    gemini_tool = _tool_to_gemini(tool)  # must not raise
+
+    params = gemini_tool.function_declarations[0].parameters
+    entry_point = params.properties["exploit_path"].properties["entry_point"]
+    assert str(entry_point.type) in ("Type.STRING", "STRING")
+    assert entry_point.nullable is True
 
 
 # ---------------------------------------------------------------------------

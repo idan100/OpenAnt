@@ -73,6 +73,18 @@ except ImportError:
 MAX_ITERATIONS = 20
 MAX_TOKENS_PER_RESPONSE = 4096
 
+# How many bounded "force a final verdict" recovery attempts to make
+# (see FindingVerifier._force_final_verdict) before a degenerate exit
+# path truly gives up. Each attempt goes through the phase's normal
+# adapter.complete() call, so a round-robin pool binding (e.g. `verify`
+# pooling Claude + Gemini) naturally rotates across DIFFERENT providers
+# on successive attempts with no special-casing needed — a provider
+# having an off moment on attempt 1 isn't asked identically 2 more
+# times. 3 is deliberately small: this fires only after the main loop
+# already tried up to MAX_ITERATIONS times, so it's the last resort,
+# not a substitute for real exploration.
+MAX_RECOVERY_ATTEMPTS = 3
+
 
 # Enhanced finish tool with exploit_path structure
 VERIFICATION_TOOLS = [
@@ -321,13 +333,106 @@ class FindingVerifier:
             suffix = " ".join(f"{k}={v}" for k, v in extras.items() if v is not None)
             print(f"    {msg} {suffix}" if suffix else f"    {msg}")
 
+    def _find_sibling_call_sites(self, function_id: Optional[str]) -> str:
+        """Deterministic (no LLM) caller-guard pre-check.
+
+        Targets the most common Stage-1 false-positive shape: a function
+        analyzed in isolation looks unguarded, but EVERY real caller
+        already validates the exact precondition Stage 1 claims is
+        missing (a length check before a memcpy, a bounds check before
+        an indexed access, etc). Tracing that by hand is a cheap, plain
+        static search — not something that should depend on the verify
+        LLM successfully completing a multi-turn tool-calling
+        investigation within its budget (the model CAN call
+        ``search_usages`` itself, but a fragile multi-turn bridge — see
+        ``providers/claude_subscription.py`` — frequently doesn't follow
+        through). Running this upfront and handing the result over as
+        ready-made context means the model doesn't have to spend its own
+        scarce turns rediscovering it.
+
+        This is a heuristic, not a proof — it can't see guards reached
+        through function pointers, virtual dispatch, or a different
+        translation unit, and a sibling call site "guarding" the same
+        variable name doesn't guarantee it's the SAME precondition. The
+        prompt text is written to make that explicit: it hands over
+        evidence for the model to weigh, not a verdict to rubber-stamp.
+
+        Returns "" (a pure no-op — the prompt is unchanged from before
+        this existed) whenever there's no index, no function_id, no
+        resolvable function name, or no other callers found.
+        """
+        if not function_id or self.index is None:
+            return ""
+
+        func = self.index.get_function(function_id)
+        if func:
+            function_name = func.get("name")
+        else:
+            # function_id didn't match the index's own key format exactly
+            # — fall back to the segment after the last ":" (mirrors
+            # RepositoryIndex's own "file/path:functionName" convention).
+            function_name = function_id.rsplit(":", 1)[-1] if ":" in function_id else function_id
+
+        if not function_name:
+            return ""
+
+        try:
+            usages = self.index.search_usages(function_name)
+        except Exception:
+            return ""
+
+        siblings = [u for u in usages if u.get("id") != function_id]
+        if not siblings:
+            return ""
+
+        lines = [
+            "AUTOMATED CALLER CHECK (deterministic static search, NOT an "
+            f"LLM claim): found {len(siblings)} other call site(s) of "
+            f"`{function_name}` elsewhere in this codebase. This is NOT a "
+            "verdict on exploitability — check whether any of these "
+            "callers already validate the exact precondition Stage 1 "
+            "claims is missing (a length check, a bounds check, a null "
+            "check, etc) before reaching this function. If every real "
+            "call path already enforces that guard, the finding is very "
+            "likely a false positive. If the guard is absent, insufficient, "
+            "or reached through a different path than what's shown here, "
+            "say so — this is evidence to weigh, not a conclusion.",
+        ]
+        shown = 0
+        for u in siblings:
+            if shown >= 5:  # bounded — don't blow the prompt on a hot function
+                break
+            caller_id = u.get("id")
+            caller_code = self.index.get_function_code(caller_id) if caller_id else None
+            if not caller_code:
+                continue
+            if len(caller_code) > 800:
+                caller_code = caller_code[:800] + "\n... (truncated — use read_function for the rest)"
+            lines.append(f"\n--- Caller: {caller_id} ---\n{caller_code}")
+            shown += 1
+
+        if shown == 0:
+            # Found sibling IDs but couldn't retrieve any of their code —
+            # not useful context, don't inject an empty-handed prompt block.
+            return ""
+
+        remaining = len(siblings) - shown
+        if remaining > 0:
+            lines.append(
+                f"\n... and {remaining} more call site(s) not shown here — "
+                f'use search_usages("{function_name}") to see them all.'
+            )
+
+        return "\n".join(lines)
+
     def verify_result(
         self,
         code: str,
         finding: str,
         attack_vector: str,
         reasoning: str,
-        files_included: list = None
+        files_included: list = None,
+        function_id: Optional[str] = None,
     ) -> VerificationResult:
         """
         Validate a Stage 1 assessment with exploit path tracing.
@@ -338,6 +443,10 @@ class FindingVerifier:
             attack_vector: Stage 1's attack vector
             reasoning: Stage 1's reasoning
             files_included: Optional list of files in context
+            function_id: Optional index key (route_key/unit_id) for the
+                flagged function — see ``_find_sibling_call_sites``. When
+                given, a deterministic caller-guard pre-check runs and its
+                findings are injected into the first prompt turn.
 
         Returns:
             VerificationResult with verdict, exploit path, and explanation
@@ -350,6 +459,10 @@ class FindingVerifier:
             files_included=files_included,
             app_context=self.app_context
         )
+
+        sibling_context = self._find_sibling_call_sites(function_id)
+        if sibling_context:
+            user_prompt = f"{user_prompt}\n\n{sibling_context}"
 
         # Get system prompt with app context if available
         system_prompt = get_verification_system_prompt(self.app_context)
@@ -391,6 +504,23 @@ class FindingVerifier:
                     assistant_content, finding, iterations,
                     total_input_tokens, total_output_tokens,
                     total_cache_creation_tokens, total_cache_read_tokens,
+                )
+                if result:
+                    return result
+
+                # Last-chance recovery (see _force_final_verdict) before
+                # giving up: one forced extra call asking for a verdict
+                # right now, instead of silently dropping the investigation.
+                (
+                    result, total_input_tokens, total_output_tokens,
+                    total_cache_creation_tokens, total_cache_read_tokens,
+                ) = self._force_final_verdict(
+                    messages, system_prompt, finding, iterations,
+                    total_input_tokens, total_output_tokens,
+                    total_cache_creation_tokens, total_cache_read_tokens,
+                    "Your last response didn't provide a usable verdict. "
+                    "Based on everything explored so far, call the `finish` "
+                    "tool now with your best assessment.",
                 )
                 if result:
                     return result
@@ -469,6 +599,24 @@ class FindingVerifier:
             # call) would send an empty-content user message, which the next
             # complete() rejects. Treat it as verification-incomplete.
             if not tool_results:
+                # Last-chance recovery before giving up: the model got cut
+                # off before completing any tool call (e.g. truncated at
+                # max_tokens) — one forced extra call asking it to
+                # conclude now from whatever it's already gathered.
+                (
+                    result, total_input_tokens, total_output_tokens,
+                    total_cache_creation_tokens, total_cache_read_tokens,
+                ) = self._force_final_verdict(
+                    messages, system_prompt, finding, iterations,
+                    total_input_tokens, total_output_tokens,
+                    total_cache_creation_tokens, total_cache_read_tokens,
+                    "Your last response didn't include a usable tool call. "
+                    "Based on everything explored so far, call the `finish` "
+                    "tool now with your best assessment.",
+                )
+                if result:
+                    return result
+
                 self.tracker.record_call(
                     model=self.binding.model,
                     input_tokens=total_input_tokens,
@@ -489,7 +637,24 @@ class FindingVerifier:
                 )
             messages.append(Message(role="user", content=list(tool_results)))
 
-        # Max iterations reached
+        # Max iterations reached — one last forced attempt at a real
+        # verdict before giving up, so exhausting the exploration budget
+        # doesn't by itself mean a vulnerability goes unassessed.
+        (
+            result, total_input_tokens, total_output_tokens,
+            total_cache_creation_tokens, total_cache_read_tokens,
+        ) = self._force_final_verdict(
+            messages, system_prompt, finding, iterations,
+            total_input_tokens, total_output_tokens,
+            total_cache_creation_tokens, total_cache_read_tokens,
+            "You've reached the investigation budget for this finding. "
+            "Based on everything explored so far, call the `finish` tool "
+            "now with your best assessment — do not request further tool "
+            "calls.",
+        )
+        if result:
+            return result
+
         self.tracker.record_call(
             model=self.binding.model,
             input_tokens=total_input_tokens,
@@ -676,7 +841,8 @@ class FindingVerifier:
                 finding=stage1_finding,
                 attack_vector=result.get("attack_vector"),
                 reasoning=result.get("reasoning", ""),
-                files_included=result.get("files_included", [])
+                files_included=result.get("files_included", []),
+                function_id=result.get("unit_id") or route_key,
             )
 
             result["verification"] = verification.to_dict()
@@ -1054,3 +1220,128 @@ class FindingVerifier:
             except Exception:
                 pass
         return None
+
+    def _force_final_verdict(
+        self,
+        messages: list[Message],
+        system_prompt: str,
+        finding: str,
+        iterations: int,
+        total_input_tokens: int,
+        total_output_tokens: int,
+        total_cache_creation_tokens: int,
+        total_cache_read_tokens: int,
+        nudge: str,
+    ) -> tuple[Optional[VerificationResult], int, int, int, int]:
+        """Last-chance recovery before a degenerate exit gives up entirely.
+
+        Exhausting the exploration budget (max iterations, a truncated
+        turn, an unparseable end_turn) is not the same as "safe" or
+        "no vulnerability" — it just means the investigation didn't
+        finish. Silently returning ``incomplete=True`` at that point
+        means a real vulnerability can go unassessed for no reason
+        other than running out of turns/tokens.
+
+        Makes up to ``MAX_RECOVERY_ATTEMPTS`` extra calls (default: 3),
+        stopping at the first one that produces a usable verdict. Each
+        attempt goes through ``self.binding.adapter.complete()`` — the
+        SAME call every other part of this class makes — so if the
+        phase's binding is a round-robin pool (see
+        ``providers/pool.py``; e.g. ``verify`` pooling a Claude
+        subscription with Gemini), each retry naturally rotates to a
+        DIFFERENT underlying provider with no special-casing needed
+        here. That matters: a provider that's throttled, effort-
+        throttled, or just having an off moment on attempt 1 doesn't
+        get asked the identical question under the identical
+        conditions two more times — a genuinely different model gets a
+        shot at it instead, wherever pooling is configured. Degrades
+        gracefully to "just ask again" for a non-pooled binding.
+
+        Every attempt restricts tools to ``finish`` only, so it can't
+        reopen another exploration round — bounded and non-recursive,
+        never a second hidden iteration budget.
+
+        Returns ``(result, updated_input_tokens, updated_output_tokens,
+        updated_cache_creation_tokens, updated_cache_read_tokens)``.
+        ``result`` is ``None`` if every attempt fails to produce a
+        usable verdict — the caller should use the UPDATED totals for
+        its own existing ``tracker.record_call()`` + ``incomplete=True``
+        return, so these calls' tokens are recorded exactly once (not
+        dropped, not double-counted) regardless of which branch already
+        did its own recording.
+        """
+        for _attempt in range(MAX_RECOVERY_ATTEMPTS):
+            (
+                result, total_input_tokens, total_output_tokens,
+                total_cache_creation_tokens, total_cache_read_tokens,
+            ) = self._attempt_final_verdict_once(
+                messages, system_prompt, finding, iterations,
+                total_input_tokens, total_output_tokens,
+                total_cache_creation_tokens, total_cache_read_tokens,
+                nudge,
+            )
+            if result is not None:
+                return result, total_input_tokens, total_output_tokens, total_cache_creation_tokens, total_cache_read_tokens
+        return None, total_input_tokens, total_output_tokens, total_cache_creation_tokens, total_cache_read_tokens
+
+    def _attempt_final_verdict_once(
+        self,
+        messages: list[Message],
+        system_prompt: str,
+        finding: str,
+        iterations: int,
+        total_input_tokens: int,
+        total_output_tokens: int,
+        total_cache_creation_tokens: int,
+        total_cache_read_tokens: int,
+        nudge: str,
+    ) -> tuple[Optional[VerificationResult], int, int, int, int]:
+        """One recovery attempt — see ``_force_final_verdict``, which
+        calls this in a bounded loop."""
+        finish_only = [td for td in self._tool_defs if td.name == "finish"]
+        retry_messages = list(messages) + [
+            Message(role="user", content=[TextBlock(nudge)])
+        ]
+        try:
+            response = self.binding.adapter.complete(
+                model=self.binding.model,
+                max_tokens=MAX_TOKENS_PER_RESPONSE,
+                system=system_prompt,
+                tools=finish_only,
+                messages=retry_messages,
+            )
+        except Exception:
+            # Never let one recovery attempt blow up verification — the
+            # caller's loop just moves on to the next attempt (which may
+            # land on a different pool member), or falls back to the
+            # normal incomplete path once attempts are exhausted. No
+            # extra tokens were consumed by a call that errored.
+            return None, total_input_tokens, total_output_tokens, total_cache_creation_tokens, total_cache_read_tokens
+
+        total_input_tokens += response.input_tokens
+        total_output_tokens += response.output_tokens
+        total_cache_creation_tokens += response.cache_creation_input_tokens
+        total_cache_read_tokens += response.cache_read_input_tokens
+
+        for block in response.content:
+            if isinstance(block, ToolUseBlock) and block.name == "finish":
+                self.tracker.record_call(
+                    model=self.binding.model,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    pricing=lookup_pricing(self.binding),
+                    cache_creation_input_tokens=total_cache_creation_tokens,
+                    cache_read_input_tokens=total_cache_read_tokens,
+                )
+                result = self._parse_finish_result(
+                    block.input, finding, iterations,
+                    total_input_tokens + total_output_tokens,
+                )
+                return result, total_input_tokens, total_output_tokens, total_cache_creation_tokens, total_cache_read_tokens
+
+        result = self._try_parse_text_response(
+            response.content, finding, iterations,
+            total_input_tokens, total_output_tokens,
+            total_cache_creation_tokens, total_cache_read_tokens,
+        )
+        return result, total_input_tokens, total_output_tokens, total_cache_creation_tokens, total_cache_read_tokens

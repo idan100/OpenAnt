@@ -30,6 +30,10 @@ pip install -r requirements.txt
 echo "ANTHROPIC_API_KEY=your-key-here" > .env
 ```
 
+That's enough to run OpenAnt against a single Claude API key. To pool
+multiple providers (free-tier keys included) for higher throughput,
+see [Multi-Provider LLM Support](#multi-provider-llm-support) below.
+
 ### Run Analysis
 
 ```bash
@@ -72,6 +76,75 @@ python generate_report.py experiment_*.json datasets/flowise/dataset_vulnerable_
 | `inconclusive` | Cannot determine security posture | Manual review needed |
 | `protected` | Dangerous operations with effective controls | Monitor |
 | `safe` | No security-sensitive operations | None |
+
+---
+
+## Multi-Provider LLM Support
+
+OpenAnt isn't locked to a single Claude API key. Each pipeline phase
+(`app_context`, `llm_reach`, `enhance`, `analyze`, `verify`,
+`dynamic_test`, `report`) resolves to a provider/model via
+`~/.config/openant/config.json`, and a phase can round-robin across
+**several** providers at once instead of just one — useful for
+stretching free-tier rate limits across a large scan, or for adding
+throughput on top of a Claude subscription.
+
+**Supported provider types:**
+
+| Type | Adapter | Notes |
+|------|---------|-------|
+| `claude_subscription` | Claude subscription auth (no API key) | Primary provider for reasoning-heavy phases |
+| `anthropic` | Anthropic API key | Standard Claude API |
+| `google` | Gemini API key | Free tier available |
+| `openai` | Any OpenAI-Chat-Completions-compatible endpoint | Set `base_url` — this is how Groq, OpenRouter, SambaNova, GitHub Models, Mistral, and Cloudflare Workers AI all plug in |
+
+**Example `config.json`** (one primary provider per phase, plus an
+optional round-robin `pool` of additional candidates):
+
+```json
+{
+  "default_llm": "subscription",
+  "llm_providers": {
+    "claude_sub": {"type": "claude_subscription"},
+    "google":     {"type": "google", "api_key": "..."},
+    "groq":       {"type": "openai", "api_key": "...", "base_url": "https://api.groq.com/openai/v1"},
+    "mistral":    {"type": "openai", "api_key": "...", "base_url": "https://api.mistral.ai/v1"}
+  },
+  "llm_configs": {
+    "subscription": {
+      "analyze": {
+        "provider": "claude_sub", "model": "opus",
+        "pool": [
+          {"provider": "google", "model": "gemini-3.1-flash-lite", "rpm_limit": 14},
+          {"provider": "groq", "model": "llama-3.3-70b-versatile", "rpm_limit": 29},
+          {"provider": "mistral", "model": "mistral-small-latest", "rpm_limit": 48}
+        ]
+      }
+    }
+  }
+}
+```
+
+`rpm_limit` paces workers so a phase doesn't fire more concurrent
+requests than a candidate's rate limit can actually serve — worth
+validating against each provider's real limit (response headers like
+`x-ratelimit-limit-requests` on OpenAI-compatible endpoints are the
+most reliable source; some providers don't expose one).
+
+A pool round-robins **per conversation**, not per API call: a
+multi-turn tool-calling phase (`enhance`, `verify`) stays on whichever
+candidate handled that unit's first turn for the rest of that unit's
+back-and-forth, then picks a (possibly different) candidate for the
+next unit. This matters because replaying one provider's tool-call
+history against a different provider generally doesn't work — Gemini
+in particular hard-rejects it.
+
+To add a new OpenAI-compatible provider, add an entry under
+`llm_providers` with `"type": "openai"` and that provider's
+`base_url` — no code changes needed. For a genuinely different API
+shape, see `utilities/llm/providers/` for the adapter pattern
+(`anthropic.py`, `google.py`, `openai.py` implement the same
+`LLMAdapter` protocol).
 
 ---
 
