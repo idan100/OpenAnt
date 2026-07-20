@@ -36,6 +36,7 @@ from .adapter import (
     ToolDef,
     ToolResultBlock,
     ToolUseBlock,
+    classify_llm_error,
 )
 from .builtins import OPENANT_DEFAULT, get_builtin_default
 from .config import (
@@ -84,6 +85,7 @@ __all__ = [
     "ToolDef",
     "ToolResultBlock",
     "ToolUseBlock",
+    "classify_llm_error",
     # builtins
     "OPENANT_DEFAULT",
     "get_builtin_default",

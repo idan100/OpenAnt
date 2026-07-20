@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from utilities.llm import LLMRateLimitError, Message, TextBlock, ToolDef, ToolResultBlock, ToolUseBlock
+from utilities.llm import LLMRateLimitError, LLMResponseError, Message, TextBlock, ToolDef, ToolResultBlock, ToolUseBlock
 from utilities.llm.providers.google import (
     _message_to_gemini,
     _name_for_tool_result,
@@ -21,7 +21,7 @@ from utilities.llm.providers.google import (
     _tool_to_gemini,
 )
 from utilities.llm_client import reset_warning_state
-from utilities.rate_limiter import get_rate_limiter, reset_rate_limiter
+from utilities.rate_limiter import get_rate_limiter, is_retryable_error, reset_rate_limiter
 
 
 @pytest.fixture(autouse=True)
@@ -196,6 +196,84 @@ def test_tool_to_gemini_builds_finding_verifier_finish_tool_without_crashing():
     entry_point = params.properties["exploit_path"].properties["entry_point"]
     assert str(entry_point.type) in ("Type.STRING", "STRING")
     assert entry_point.nullable is True
+
+
+# ---------------------------------------------------------------------------
+# Gemini tool-calling failure states (MALFORMED_FUNCTION_CALL /
+# UNEXPECTED_TOOL_CALL) — provider-reported failures, must not silently
+# normalise to a clean end_turn like an ordinary unknown finish_reason.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("reason", ["MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"])
+def test_tool_error_finish_reasons_raise_instead_of_normalising(reason):
+    from tests._llm_factories.google import _candidate, _response
+
+    response = _response(
+        candidates=[_candidate(parts=[], finish_reason=reason)],
+        prompt_tokens=1, candidate_tokens=0,
+    )
+    with pytest.raises(LLMResponseError) as excinfo:
+        _response_to_unified(response)
+    # Must be retryable — a fresh retry gets a new conversation, which can
+    # land on a different pool candidate entirely.
+    assert is_retryable_error(str(excinfo.value))
+
+
+def test_normal_finish_reason_still_normalises():
+    from tests._llm_factories.google import _candidate, _response, _text_part
+
+    response = _response(
+        candidates=[_candidate(parts=[_text_part("hi")], finish_reason="STOP")],
+        prompt_tokens=1, candidate_tokens=1,
+    )
+    result = _response_to_unified(response)
+    assert result.stop_reason == "end_turn"
+
+
+# ---------------------------------------------------------------------------
+# Explicit HTTP timeout — the SDK's own default is unset, which httpx
+# treats as "disable all timeouts" rather than falling back to its own
+# 5s default. Without this, a stalled connection or a very slow
+# generation hangs the adapter forever (observed: 220+ seconds with
+# zero progress on an app_context call, until manually interrupted).
+# ---------------------------------------------------------------------------
+
+
+def test_client_constructed_with_explicit_timeout(monkeypatch):
+    from utilities.llm.providers import google as google_module
+
+    captured = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(google_module.genai, "Client", _FakeClient)
+    google_module.GoogleAdapter(api_key="x")
+
+    http_options = captured.get("http_options")
+    assert http_options is not None, "must always construct HttpOptions to carry the timeout"
+    assert http_options.timeout == 600_000, "600s in milliseconds, matching Anthropic/OpenAI's read timeout default"
+
+
+def test_timeout_is_set_even_with_no_other_http_options_needed(monkeypatch):
+    """Previously HttpOptions was only constructed when base_url or a
+    non-default max_retries needed it -- confirm the timeout survives
+    even on the plain-default construction path."""
+    from utilities.llm.providers import google as google_module
+
+    captured = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(google_module.genai, "Client", _FakeClient)
+    google_module.GoogleAdapter(api_key="x", base_url=None, max_retries=None)
+
+    assert captured.get("http_options") is not None
+    assert captured["http_options"].timeout == 600_000
 
 
 # ---------------------------------------------------------------------------

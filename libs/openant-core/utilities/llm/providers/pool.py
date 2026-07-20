@@ -48,16 +48,93 @@ advances the rotation again. Single-shot phases (analyze, app_context,
 report, ...) never carry an assistant turn either, so they round-robin
 on every call exactly as before — this only changes behavior for
 actual multi-turn tool loops.
+
+When EVERY candidate is currently busy (rate-limited or out of RPM
+slots), ``complete()`` does not commit to trying them in fixed
+rotation order — that just means blocking on whichever one the
+rotation happens to land on first, which from the outside looks
+identical to "the same model, over and over, failing" even though
+each individual wait is technically correct. Instead it checks who
+will clear soonest (a non-blocking peek — see ``_candidate_wait_seconds``)
+and sleeps exactly that long, then re-evaluates from scratch, so a
+DIFFERENT, healthier candidate gets a chance if one exists. Bounded to
+candidates clearing within ``_MAX_CENTRAL_WAIT_SECONDS`` and
+``_MAX_CENTRAL_WAIT_ROUNDS`` rounds — beyond that it falls through to
+the old best-effort dispatch rather than stalling indefinitely.
 """
 
 from __future__ import annotations
 
+import random
 import sys
 import threading
+import time
 from typing import Optional
 
 from ..adapter import LLMAdapter, LLMError, LLMRateLimitError
 from ...rate_limiter import get_rate_limiter, get_rpm_pacer
+
+# "the next minute" — see complete()'s "every candidate busy" handling.
+_MAX_CENTRAL_WAIT_SECONDS = 60.0
+# Bounded so a pool where backoffs keep getting extended (siblings
+# hitting fresh 429s while we wait) still eventually falls through to
+# best-effort dispatch instead of stalling here indefinitely.
+_MAX_CENTRAL_WAIT_ROUNDS = 5
+
+
+def _candidate_wait_seconds(provider_name: str, model: str) -> float:
+    """Non-blocking: seconds until this (provider, model) candidate
+    could plausibly serve a request right now — the longer of its
+    global-backoff remaining and its RPM pacer's remaining slot wait,
+    0 if neither currently blocks it.
+    """
+    backoff_wait = get_rate_limiter(provider_name).time_until_ready()
+    pacer = get_rpm_pacer(provider_name, model)
+    pacer_wait = pacer.time_until_slot() if pacer is not None else 0.0
+    return max(backoff_wait, pacer_wait)
+from ...token_estimate import CHARS_PER_TOKEN, max_request_tokens_for
+
+
+def _estimate_request_tokens(system, messages) -> int:
+    """Rough size of one ``complete()`` call — duck-typed against the
+    unified ``Message``/content-block shapes without importing them, so
+    this stays decoupled from the concrete adapter contract the same
+    way the rest of this generic ``**kwargs``-passthrough class does.
+    """
+    total_chars = len(system) if isinstance(system, str) else 0
+    for message in messages or []:
+        for block in getattr(message, "content", None) or []:
+            text = getattr(block, "text", None)
+            if isinstance(text, str):
+                total_chars += len(text)
+            content = getattr(block, "content", None)
+            if isinstance(content, str):
+                total_chars += len(content)
+    return total_chars // CHARS_PER_TOKEN
+
+
+class _PoolPricing(dict):
+    """Lazily queries each candidate's OWN ``pricing.get(model)`` on
+    lookup rather than eagerly merging into a plain dict — see
+    ``PoolAdapter.pricing``'s docstring for why eager merging silently
+    drops a candidate like claude_sub's ``_ZeroCostPricing``. Empty by
+    construction (``dict.__init__`` never called with real items); all
+    real behavior lives in ``get()``.
+    """
+
+    def __init__(self, candidates: list[tuple[LLMAdapter, str, str]]):
+        super().__init__()
+        self._candidates = candidates
+
+    def get(self, key, default=None):  # noqa: ANN001 - dict-compatible signature
+        for adapter, _, _ in self._candidates:
+            price = getattr(adapter, "pricing", None)
+            if price is None:
+                continue
+            found = price.get(key)
+            if found is not None:
+                return found
+        return default
 
 
 class PoolAdapter:
@@ -100,17 +177,25 @@ class PoolAdapter:
         return all(adapter.supports_tools for adapter, _, _ in self._candidates)
 
     @property
-    def pricing(self) -> dict:
+    def pricing(self) -> _PoolPricing:
         # Best-effort union so a pricing lookup succeeds for whichever
         # candidate actually served a given call. Real per-call cost
         # attribution still keys off PhaseBinding.model, which is a
         # documented limitation shared with FailoverAdapter (see that
         # module's docstring) — this just avoids an unnecessary
         # "unknown model" warning on top of it.
-        merged: dict = {}
-        for adapter, _, _ in self._candidates:
-            merged.update(getattr(adapter, "pricing", None) or {})
-        return merged
+        #
+        # Deliberately NOT an eager dict.update() merge: claude_sub's
+        # ``_ZeroCostPricing`` reports $0 via a custom ``.get()``
+        # override with no real stored keys (by design — subscription
+        # billing has no marginal cost), so merging it via
+        # ``dict.update()`` (which only copies STORED items) silently
+        # drops it — the moment claude_sub is a pool member rather than
+        # a standalone adapter, ``lookup_pricing()`` stops seeing it and
+        # fires a spurious "no pricing for model 'opus'" warning. Lazily
+        # querying each candidate's OWN ``.get()`` instead respects
+        # whatever pricing behavior that candidate actually implements.
+        return _PoolPricing(self._candidates)
 
     def _rotate_start(self) -> int:
         with self._lock:
@@ -134,29 +219,70 @@ class PoolAdapter:
             sys.stderr.write(f"[pool:{self._phase}] -> {provider_name}/{candidate_model} (sticky)\n")
             return adapter.complete(model=candidate_model, **kwargs)
 
-        start = self._rotate_start()
         n = len(self._candidates)
+        estimated_tokens = _estimate_request_tokens(kwargs.get("system"), messages)
 
-        ready: list[tuple[int, LLMAdapter, str, str]] = []
-        busy: list[tuple[int, LLMAdapter, str, str]] = []
-        for offset in range(n):
-            idx = (start + offset) % n
-            adapter, candidate_model, provider_name = self._candidates[idx]
-            if get_rate_limiter(provider_name).is_in_backoff():
-                busy.append((idx, adapter, candidate_model, provider_name))
-                continue
-            pacer = get_rpm_pacer(provider_name, candidate_model)
-            if pacer is not None and not pacer.has_immediate_slot():
-                busy.append((idx, adapter, candidate_model, provider_name))
-                continue
-            ready.append((idx, adapter, candidate_model, provider_name))
+        for _round in range(_MAX_CENTRAL_WAIT_ROUNDS + 1):
+            start = self._rotate_start()
+
+            ready: list[tuple[int, LLMAdapter, str, str]] = []
+            busy: list[tuple[int, LLMAdapter, str, str]] = []
+            # Candidates with a KNOWN per-request token ceiling this
+            # call would exceed (see utilities/token_estimate.py) —
+            # tried only as an absolute last resort. Unlike "busy",
+            # waiting never helps here: the request is simply too big
+            # for that provider's tier, so it's worse odds than a
+            # rate-limited candidate that will clear on its own.
+            oversized: list[tuple[int, LLMAdapter, str, str]] = []
+            for offset in range(n):
+                idx = (start + offset) % n
+                adapter, candidate_model, provider_name = self._candidates[idx]
+                ceiling = max_request_tokens_for(provider_name, candidate_model)
+                if ceiling is not None and estimated_tokens > ceiling:
+                    oversized.append((idx, adapter, candidate_model, provider_name))
+                    continue
+                if get_rate_limiter(provider_name).is_in_backoff():
+                    busy.append((idx, adapter, candidate_model, provider_name))
+                    continue
+                pacer = get_rpm_pacer(provider_name, candidate_model)
+                if pacer is not None and not pacer.has_immediate_slot():
+                    busy.append((idx, adapter, candidate_model, provider_name))
+                    continue
+                ready.append((idx, adapter, candidate_model, provider_name))
+
+            if ready or not busy or _round == _MAX_CENTRAL_WAIT_ROUNDS:
+                break
+
+            # EVERY candidate is busy. Committing to rotation order here
+            # means blocking on whichever one the rotation happens to
+            # land on first — often the SAME struggling candidate every
+            # time, which is indistinguishable from "the same model
+            # over and over, failing" from the outside, even though
+            # each individual wait is technically correct. Instead:
+            # check who will actually clear soonest and sleep exactly
+            # that long, then re-evaluate from scratch — a different,
+            # healthier candidate may now be ready, not just the one we
+            # waited for.
+            soonest = min(
+                _candidate_wait_seconds(provider_name, candidate_model)
+                for _, _, candidate_model, provider_name in busy
+            )
+            if soonest > _MAX_CENTRAL_WAIT_SECONDS:
+                break  # nothing clearing soon enough — fall through to best-effort dispatch below
+            sys.stderr.write(
+                f"[pool:{self._phase}] all {len(busy)} candidate(s) busy — "
+                f"waiting {soonest:.0f}s for the soonest to free up "
+                f"(not blindly retrying the same one)\n"
+            )
+            time.sleep(soonest + random.uniform(0.05, 1.0))
 
         # Try candidates with no known reason to block first, in
-        # rotation order; only fall through to a busy one (which will
-        # then block on ITS OWN pacer/backoff) if every candidate is
-        # currently busy — "just wait" is still better than erroring.
+        # rotation order; fall through to a busy one (which will then
+        # block on ITS OWN pacer/backoff) before an oversized one —
+        # "just wait" beats "definitely too big" — and only reach
+        # oversized if literally nothing else is available.
         last_exc: Optional[LLMRateLimitError] = None
-        for idx, adapter, candidate_model, provider_name in ready + busy:
+        for idx, adapter, candidate_model, provider_name in ready + busy + oversized:
             sys.stderr.write(f"[pool:{self._phase}] -> {provider_name}/{candidate_model}\n")
             try:
                 result = adapter.complete(model=candidate_model, **kwargs)

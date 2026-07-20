@@ -21,12 +21,14 @@ from utilities.llm import (
     LLMError,
     LLMNotFoundError,
     LLMRateLimitError,
+    LLMRefusalError,
     LLMResponseError,
     Message,
     TextBlock,
     ToolDef,
     ToolResultBlock,
     ToolUseBlock,
+    classify_llm_error,
 )
 
 
@@ -210,3 +212,35 @@ class TestProvidersRegistry:
             get_adapter_class("bogus-provider")
         # Message must point contributors at the recipe doc.
         assert "HOW_TO_ADD_AN_ADAPTER.md" in str(exc_info.value)
+
+
+class TestClassifyLLMError:
+    """classify_llm_error buckets by the exception's ACTUAL type, so
+    checkpoint/summary tracking (core/analyzer.py, finding_verifier.py)
+    can show WHAT kind of failures happened during a scan instead of
+    lumping every error into one hardcoded 'api' count."""
+
+    def test_rate_limit(self):
+        assert classify_llm_error(LLMRateLimitError("slow down")) == "rate_limit"
+
+    def test_connection(self):
+        assert classify_llm_error(LLMConnectionError("dns failed")) == "connection"
+
+    def test_auth(self):
+        assert classify_llm_error(LLMAuthError("bad key")) == "auth"
+
+    def test_not_found(self):
+        assert classify_llm_error(LLMNotFoundError("no such model")) == "not_found"
+
+    def test_refusal_before_its_parent_response_error(self):
+        # LLMRefusalError subclasses LLMResponseError -- must be
+        # checked FIRST or isinstance would match the broader parent.
+        assert classify_llm_error(LLMRefusalError("content filtered")) == "refusal"
+
+    def test_generic_response_error(self):
+        assert classify_llm_error(LLMResponseError("malformed")) == "malformed_response"
+
+    def test_non_llm_exception_is_internal(self):
+        assert classify_llm_error(KeyError("oops")) == "internal"
+        assert classify_llm_error(TypeError("oops")) == "internal"
+        assert classify_llm_error(ValueError("oops")) == "internal"

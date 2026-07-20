@@ -270,6 +270,23 @@ class RpmPacer:
             active = sum(1 for t in self._timestamps if now - t < 60.0)
             return active < self._limit
 
+    def time_until_slot(self) -> float:
+        """Non-blocking: seconds until ``wait_for_slot()`` would return
+        (0 if it would return immediately right now).
+
+        Companion to :meth:`GlobalRateLimiter.time_until_ready` — lets
+        a caller decide WHOM to wait for before committing to a sleep,
+        rather than blocking blind inside ``wait_for_slot()`` on
+        whichever candidate it happened to try first (see
+        ``providers/pool.py``'s "all candidates busy" handling).
+        """
+        with self._lock:
+            now = time.monotonic()
+            active = [t for t in self._timestamps if now - t < 60.0]
+            if len(active) < self._limit:
+                return 0.0
+            return max(0.0, 60.0 - (now - active[0]))
+
     def reset(self) -> None:
         """Clear tracked request history. For testing."""
         with self._lock:
@@ -376,4 +393,16 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
     return any(term in error_str for term in (
         "rate_limit", "connection", "timeout",
         "500", "502", "503", "504", "529", "overloaded",
+        # Provider-reported failure states (finish_reason='error' /
+        # 'tool_use_failed') and detected pseudo-tool-call syntax
+        # leakage — see utilities/llm/providers/openai.py. A fresh
+        # retry gets a NEW conversation, which (via PoolAdapter's
+        # per-conversation stickiness) can land on a different, less
+        # broken candidate — often enough to be worth retrying.
+        "finish_reason='error'", "finish_reason='tool_use_failed'",
+        "malformed_tool_syntax",
+        # Gemini's tool-calling failure states (see google.py) — matched
+        # without a "finish_reason=" prefix since the SDK sometimes
+        # stringifies the enum as "FinishReason.X" rather than bare "X".
+        "malformed_function_call", "unexpected_tool_call",
     ))

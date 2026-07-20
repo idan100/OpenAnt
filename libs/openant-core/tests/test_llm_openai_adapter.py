@@ -27,10 +27,17 @@ import httpx
 import openai
 import pytest
 
-from utilities.llm import LLMRateLimitError, LLMResponseError, Message, TextBlock
-from utilities.llm.providers.openai import OpenAIAdapter
+from utilities.llm import (
+    LLMRateLimitError,
+    LLMResponseError,
+    Message,
+    TextBlock,
+    ToolDef,
+    ToolUseBlock,
+)
+from utilities.llm.providers.openai import OpenAIAdapter, _messages_to_openai, reset_warnings
 from utilities.llm_client import reset_warning_state
-from utilities.rate_limiter import get_rate_limiter, reset_rate_limiter
+from utilities.rate_limiter import get_rate_limiter, is_retryable_error, reset_rate_limiter
 
 
 @pytest.fixture(autouse=True)
@@ -39,9 +46,11 @@ def _reset_state():
     # make later tests sleep ~30s. Reset before and after every test.
     reset_rate_limiter()
     reset_warning_state()
+    reset_warnings()
     yield
     reset_rate_limiter()
     reset_warning_state()
+    reset_warnings()
 
 
 def _text_response(*, prompt_tokens=1, completion_tokens=1):
@@ -214,3 +223,160 @@ def test_complete_consults_limiter_before_request(monkeypatch):
     )
     adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8)
     assert seen["waited"], "complete() must call wait_if_needed before the request (H1)"
+
+
+# ---------------------------------------------------------------------------
+# Cloudflare "oneOf not met ... 'string' not in 'null'" — an assistant
+# tool-call-only message must send content="" not content=None. Confirmed
+# empirically against the real Cloudflare Workers AI API.
+# ---------------------------------------------------------------------------
+
+
+def test_assistant_tool_call_only_message_sends_empty_string_content():
+    messages = [
+        Message(role="user", content=[TextBlock("call it")]),
+        Message(role="assistant", content=[ToolUseBlock(id="t1", name="echo", input={})]),
+    ]
+    out = _messages_to_openai(messages, system=None, model="gpt-4o")
+    assistant_msg = next(m for m in out if m["role"] == "assistant")
+    assert assistant_msg["content"] == "", "must be empty string, not None (Cloudflare 400s on null)"
+
+
+def test_assistant_message_with_text_and_tool_calls_keeps_the_text():
+    messages = [
+        Message(role="assistant", content=[
+            TextBlock("let me check"),
+            ToolUseBlock(id="t1", name="echo", input={}),
+        ]),
+    ]
+    out = _messages_to_openai(messages, system=None, model="gpt-4o")
+    assert out[0]["content"] == "let me check"
+
+
+# ---------------------------------------------------------------------------
+# finish_reason='error' / 'tool_use_failed' — provider-reported failures
+# must not silently normalise to a clean end_turn.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("reason", ["error", "tool_use_failed"])
+def test_error_finish_reasons_raise_instead_of_normalising(reason):
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=None, tool_calls=None),
+            finish_reason=reason,
+        )],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=0),
+    )
+    adapter, _ = _stub(lambda **kw: response)
+    with pytest.raises(LLMResponseError) as excinfo:
+        adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8)
+    # Must be retryable — a fresh retry gets a new conversation, which can
+    # land on a different pool candidate entirely.
+    assert is_retryable_error(str(excinfo.value))
+
+
+def test_normal_finish_reasons_still_pass_through():
+    adapter, _ = _stub(lambda **kw: _text_response())
+    result = adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8)
+    assert result.stop_reason == "end_turn"
+
+
+# ---------------------------------------------------------------------------
+# Hallucinated tool names — visibility (one-time warning), not a behavior
+# change: ToolExecutor already handles an unknown tool name gracefully.
+# ---------------------------------------------------------------------------
+
+
+def _tool_call_response(name, arguments="{}"):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content=None,
+                tool_calls=[SimpleNamespace(
+                    id="t1", function=SimpleNamespace(name=name, arguments=arguments),
+                )],
+            ),
+            finish_reason="tool_calls",
+        )],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+    )
+
+
+def test_hallucinated_tool_call_warns_once(capsys):
+    adapter, _ = _stub(lambda **kw: _tool_call_response("not_offered"))
+    tools = [ToolDef(name="search_usages", description="x", input_schema={})]
+    adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8, tools=tools)
+    err = capsys.readouterr().err
+    assert "not_offered" in err
+    assert "not in the offered tools list" in err
+
+
+def test_offered_tool_call_does_not_warn(capsys):
+    adapter, _ = _stub(lambda **kw: _tool_call_response("search_usages"))
+    tools = [ToolDef(name="search_usages", description="x", input_schema={})]
+    adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8, tools=tools)
+    err = capsys.readouterr().err
+    assert "hallucinated" not in err.lower()
+
+
+def test_hallucinated_tool_still_produces_a_usable_tool_use_block():
+    """Visibility only — ToolExecutor downstream still gets a normal
+    ToolUseBlock so its existing 'unknown tool' self-correction flow
+    keeps working unchanged."""
+    adapter, _ = _stub(lambda **kw: _tool_call_response("not_offered"))
+    tools = [ToolDef(name="search_usages", description="x", input_schema={})]
+    result = adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8, tools=tools)
+    tool_use = next(b for b in result.content if isinstance(b, ToolUseBlock))
+    assert tool_use.name == "not_offered"
+
+
+# ---------------------------------------------------------------------------
+# Pseudo-tool-call syntax leakage (<function=...></function> in plain
+# text instead of a native tool_calls entry) — observed from weaker
+# open-source models on some free-tier pools.
+# ---------------------------------------------------------------------------
+
+
+def test_pseudo_tool_call_syntax_raises_retryable_error():
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content='<function=search_usages{"function_name": "x"}</function>',
+                tool_calls=None,
+            ),
+            finish_reason="stop",
+        )],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+    )
+    adapter, _ = _stub(lambda **kw: response)
+    tools = [ToolDef(name="search_usages", description="x", input_schema={})]
+    with pytest.raises(LLMResponseError) as excinfo:
+        adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8, tools=tools)
+    assert is_retryable_error(str(excinfo.value))
+
+
+def test_pseudo_tool_call_syntax_ignored_when_no_tools_were_offered():
+    """The same text is fine as plain output when tools weren't even
+    on the table — only flagged when it looks like a failed attempt to
+    use tools that WERE offered."""
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content='the docs show <function=foo></function> as an example',
+                tool_calls=None,
+            ),
+            finish_reason="stop",
+        )],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+    )
+    adapter, _ = _stub(lambda **kw: response)
+    result = adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8)  # no tools=
+    assert result.stop_reason == "end_turn"
+
+
+def test_normal_text_response_with_tools_offered_is_unaffected():
+    adapter, _ = _stub(lambda **kw: _text_response())
+    tools = [ToolDef(name="search_usages", description="x", input_schema={})]
+    result = adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8, tools=tools)
+    assert result.stop_reason == "end_turn"

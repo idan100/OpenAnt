@@ -47,6 +47,7 @@ from .llm import (
     ToolDef,
     ToolResultBlock,
     ToolUseBlock,
+    classify_llm_error,
     effective_worker_count,
     lookup_pricing,
 )
@@ -72,6 +73,23 @@ except ImportError:
 
 MAX_ITERATIONS = 20
 MAX_TOKENS_PER_RESPONSE = 4096
+
+
+def _safe_dict(value: object) -> dict:
+    """Return ``value`` if it's a dict, else ``{}``.
+
+    ``result.get("verification", {})`` only substitutes the default
+    when the key is MISSING — if a weaker model wrote e.g.
+    ``"verification": "N/A"`` or ``"exploit_path": "not applicable"``
+    (a plausible, observed shape from some free-tier pool members)
+    instead of an object, the key IS present, so ``.get()`` returns the
+    string, and chaining another ``.get()`` onto it crashes with
+    ``'str' object has no attribute 'get'``. Every ``.get(key, {})``
+    chain on a value that ultimately came from parsed LLM JSON should
+    route through this instead — never assume a "should be a dict"
+    field actually is one.
+    """
+    return value if isinstance(value, dict) else {}
 
 # How many bounded "force a final verdict" recovery attempts to make
 # (see FindingVerifier._force_final_verdict) before a degenerate exit
@@ -714,7 +732,7 @@ class FindingVerifier:
             or correct_finding == 'error'."""
             if not cp_data:
                 return True
-            v = cp_data.get("verification", {})
+            v = _safe_dict(cp_data.get("verification"))
             if not v:
                 return True
             return v.get("correct_finding") == "error"
@@ -779,13 +797,18 @@ class FindingVerifier:
                                      _summary_error_breakdown, phase="in_progress",
                                      usage=_usage_dict())
 
-        def _summary_callback(detail, usage=None):
+        def _summary_callback(detail, usage=None, error_type=None):
             """Update summary counters after each unit. Called from main thread."""
             nonlocal _summary_completed, _summary_errors, _summary_error_breakdown
             nonlocal _summary_input_tokens, _summary_output_tokens, _summary_cost_usd
             if detail == "error":
                 _summary_errors += 1
-                _summary_error_breakdown["api"] = _summary_error_breakdown.get("api", 0) + 1
+                # See utilities/llm/adapter.py:classify_llm_error — same
+                # per-type bucketing as core/analyzer.py's Stage 1
+                # summary, rather than every failure collapsing into one
+                # hardcoded "api" count.
+                _bucket = error_type or "api"
+                _summary_error_breakdown[_bucket] = _summary_error_breakdown.get(_bucket, 0) + 1
             else:
                 _summary_completed += 1
             if usage:
@@ -869,7 +892,9 @@ class FindingVerifier:
             # Fail-safe: an adapter raise (e.g. R4-1/R4-2 empty/refusal) must
             # NEVER read as safe — it is unverified and needs manual review.
             err_msg = f"{type(e).__name__}: {e}"
+            error_type = classify_llm_error(e)
             result["error"] = err_msg
+            result["error_type"] = error_type
             # Surface a minimal verification dict marked incomplete so any
             # consumer that branches on ``verification.incomplete`` also treats
             # it as needs-review rather than a clean verdict.
@@ -880,7 +905,8 @@ class FindingVerifier:
 
         unit_elapsed = time.monotonic() - unit_start
         usage = self.tracker.get_unit_usage()
-        return route_key, detail, unit_elapsed, worker, usage
+        error_type = result.get("error_type") if detail == "error" else None
+        return route_key, detail, unit_elapsed, worker, usage, error_type
 
     def _verify_batch_sequential(self, results, code_by_route, progress_callback,
                                  checkpoint=None, summary_callback=None):
@@ -892,7 +918,7 @@ class FindingVerifier:
                 self._log("info", f"Verifying finding {i+1}/{len(results)}",
                           unit_id=route_key, classification=stage1_finding)
 
-                route_key, detail, unit_elapsed, _worker, usage = self._verify_one(result, code_by_route)
+                route_key, detail, unit_elapsed, _worker, usage, error_type = self._verify_one(result, code_by_route)
                 if checkpoint is not None:
                     key = result.get("unit_id") or route_key
                     cp_data = {
@@ -904,7 +930,7 @@ class FindingVerifier:
                         cp_data["usage"] = usage
                     checkpoint.save(key, cp_data)
                 if summary_callback:
-                    summary_callback(detail, usage=usage)
+                    summary_callback(detail, usage=usage, error_type=error_type)
                 if progress_callback:
                     progress_callback(route_key, detail, unit_elapsed)
         except KeyboardInterrupt:
@@ -927,7 +953,7 @@ class FindingVerifier:
         try:
             for future in as_completed(future_to_result):
                 result = future_to_result[future]
-                route_key, detail, unit_elapsed, worker, usage = future.result()
+                route_key, detail, unit_elapsed, worker, usage, error_type = future.result()
                 if checkpoint is not None:
                     key = result.get("unit_id") or route_key
                     cp_data = {
@@ -939,7 +965,7 @@ class FindingVerifier:
                         cp_data["usage"] = usage
                     checkpoint.save(key, cp_data)
                 if summary_callback:
-                    summary_callback(detail, usage=usage)
+                    summary_callback(detail, usage=usage, error_type=error_type)
                 if progress_callback:
                     progress_callback(route_key, f"{detail}  [{worker}]", unit_elapsed)
         except KeyboardInterrupt:
@@ -972,7 +998,7 @@ class FindingVerifier:
             if len(group) < 2:
                 continue
 
-            verdicts = set(r.get("verification", {}).get("correct_finding") or r.get("finding") for r in group)
+            verdicts = set(_safe_dict(r.get("verification")).get("correct_finding") or r.get("finding") for r in group)
             if len(verdicts) > 1:
                 inconsistent_groups.append((pattern, group))
 
@@ -982,7 +1008,7 @@ class FindingVerifier:
 
         # Fix inconsistencies
         for pattern, group in inconsistent_groups:
-            verdicts = [r.get("verification", {}).get("correct_finding") or r.get("finding") for r in group]
+            verdicts = [_safe_dict(r.get("verification")).get("correct_finding") or r.get("finding") for r in group]
             self._log("warning", f"Inconsistency detected in pattern: {pattern}",
                       details={"findings": [r.get('route_key') for r in group], "verdicts": verdicts})
 
@@ -1003,7 +1029,7 @@ class FindingVerifier:
                                           unit_id=route_key)
                                 continue
 
-                            old_verdict = result.get("verification", {}).get("correct_finding") or result.get("finding")
+                            old_verdict = _safe_dict(result.get("verification")).get("correct_finding") or result.get("finding")
                             if old_verdict != new_verdict:
                                 result["finding"] = new_verdict
                                 if "verification" not in result:
@@ -1034,14 +1060,14 @@ class FindingVerifier:
         These findings are based on detailed code analysis and should not be
         overridden by superficial pattern matching.
         """
-        verification = result.get("verification", {})
+        verification = _safe_dict(result.get("verification"))
 
         # If max iterations was reached, the analysis is not conclusive
         if verification.get("explanation") == "Max iterations reached":
             return False
 
         # Check for exploit path analysis
-        exploit_path = verification.get("exploit_path")
+        exploit_path = _safe_dict(verification.get("exploit_path"))
         if not exploit_path:
             return False
 

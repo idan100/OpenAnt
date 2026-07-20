@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 from core.schemas import (
-    ScanResult, AnalysisMetrics, UsageInfo, StepReport,
+    ScanResult, AnalysisMetrics, AnalyzeResult, ParseResult, UsageInfo, StepReport,
 )
 from core.step_report import step_context
 from core import tracking
@@ -152,51 +152,70 @@ def scan_repository(
         "all" if (llm_reachability and processing_level != "all") else processing_level
     )
 
-    print(_step_label("Parsing repository..."), file=sys.stderr)
-    if effective_parse_level != processing_level:
-        print(
-            "  [LLM reachability] parsing all units; structural filter runs after LLM signals",
-            file=sys.stderr,
+    # diff_manifest is excluded from reuse: it can differ between
+    # invocations against the same output_dir, and re-applying a possibly
+    # DIFFERENT diff scope on stale dataset.json would silently reuse the
+    # wrong filtering -- only skip-reuse the common (no diff_manifest) case.
+    _prior_parse = None if diff_manifest else _load_completed_step(output_dir, "parse")
+    if _prior_parse is not None:
+        print(_step_label("Parsing repository... (reusing completed parse)"), file=sys.stderr)
+        _outputs = _prior_parse.get("outputs") or {}
+        _summary = _prior_parse.get("summary") or {}
+        parse_result = ParseResult(
+            dataset_path=_outputs["dataset_path"],
+            analyzer_output_path=_outputs.get("analyzer_output_path"),
+            units_count=_summary.get("total_units", 0),
+            language=_summary.get("language", "unknown"),
+            processing_level=_summary.get("processing_level", effective_parse_level),
         )
+        collected_step_reports.append(_prior_parse)
+    else:
+        print(_step_label("Parsing repository..."), file=sys.stderr)
+        if effective_parse_level != processing_level:
+            print(
+                "  [LLM reachability] parsing all units; structural filter runs after LLM signals",
+                file=sys.stderr,
+            )
 
-    with step_context("parse", output_dir, inputs={
-        "repo_path": repo_path,
-        "language": language,
-        "processing_level": effective_parse_level,
-        "skip_tests": skip_tests,
-    }) as ctx:
-        parse_result = parse_repository(
-            repo_path=repo_path,
-            output_dir=output_dir,
-            language=language,
-            processing_level=effective_parse_level,
-            skip_tests=skip_tests,
-            diff_manifest=diff_manifest,
-            library_mode=library_mode,
-        )
+        with step_context("parse", output_dir, inputs={
+            "repo_path": repo_path,
+            "language": language,
+            "processing_level": effective_parse_level,
+            "skip_tests": skip_tests,
+        }) as ctx:
+            parse_result = parse_repository(
+                repo_path=repo_path,
+                output_dir=output_dir,
+                language=language,
+                processing_level=effective_parse_level,
+                skip_tests=skip_tests,
+                diff_manifest=diff_manifest,
+                library_mode=library_mode,
+            )
 
-        ctx.summary = {
-            "total_units": parse_result.units_count,
-            "language": parse_result.language,
-            "processing_level": parse_result.processing_level,
-        }
-        # If the parse step generated a diff_stats report, attach it.
-        _diff_report = os.path.join(output_dir, "diff_filter.report.json")
-        if os.path.exists(_diff_report):
-            try:
-                ctx.summary["diff_stats"] = read_json(_diff_report)
-            except (json.JSONDecodeError, OSError):
-                pass
-        ctx.outputs = {
-            "dataset_path": parse_result.dataset_path,
-            "analyzer_output_path": parse_result.analyzer_output_path,
-        }
+            ctx.summary = {
+                "total_units": parse_result.units_count,
+                "language": parse_result.language,
+                "processing_level": parse_result.processing_level,
+            }
+            # If the parse step generated a diff_stats report, attach it.
+            _diff_report = os.path.join(output_dir, "diff_filter.report.json")
+            if os.path.exists(_diff_report):
+                try:
+                    ctx.summary["diff_stats"] = read_json(_diff_report)
+                except (json.JSONDecodeError, OSError):
+                    pass
+            ctx.outputs = {
+                "dataset_path": parse_result.dataset_path,
+                "analyzer_output_path": parse_result.analyzer_output_path,
+            }
+
+        collected_step_reports.append(_load_step_report(output_dir, "parse"))
 
     result.dataset_path = parse_result.dataset_path
     result.analyzer_output_path = parse_result.analyzer_output_path
     result.units_count = parse_result.units_count
     result.language = parse_result.language
-    collected_step_reports.append(_load_step_report(output_dir, "parse"))
 
     print(f"  Parsed: {parse_result.units_count} units ({parse_result.language})",
           file=sys.stderr)
@@ -209,7 +228,15 @@ def scan_repository(
     # Step 2: Application Context (optional)
     # ---------------------------------------------------------------
     app_context_path: str | None = None
-    if generate_context and HAS_APP_CONTEXT:
+    _prior_app_context = _load_completed_step(output_dir, "app-context") if generate_context and HAS_APP_CONTEXT else None
+    if _prior_app_context is not None:
+        print(_step_label("Generating application context... (reusing completed run)"), file=sys.stderr)
+        app_context_path = (_prior_app_context.get("outputs") or {}).get("app_context_path")
+        result.app_context_path = app_context_path
+        _app_type = (_prior_app_context.get("summary") or {}).get("application_type")
+        print(f"  App type: {_app_type}", file=sys.stderr)
+        collected_step_reports.append(_prior_app_context)
+    elif generate_context and HAS_APP_CONTEXT:
         print(_step_label("Generating application context..."), file=sys.stderr)
 
         with step_context("app-context", output_dir, inputs={
@@ -438,44 +465,74 @@ def scan_repository(
     # ---------------------------------------------------------------
     from core.analyzer import run_analysis
 
-    print(_step_label("Running vulnerability detection (Stage 1)..."), file=sys.stderr)
-
     analyze_binding = registry.get("analyze")
-    with step_context("analyze", output_dir, inputs={
-        "dataset_path": active_dataset_path,
-        "model": analyze_binding.model,
-        "provider": analyze_binding.provider_name,
-        "limit": limit,
-    }) as ctx:
-        analyze_result = run_analysis(
-            dataset_path=active_dataset_path,
-            output_dir=output_dir,
-            analyzer_output_path=parse_result.analyzer_output_path,
-            app_context_path=app_context_path,
-            repo_path=repo_path,
-            limit=limit,
-            registry=registry,
-            workers=workers,
-            backoff_seconds=backoff_seconds,
-        )
 
-        ctx.summary = {
-            "total_units": analyze_result.metrics.total,
-            "analyzed": analyze_result.metrics.total - analyze_result.metrics.errors,
-            "verdicts": {
-                "vulnerable": analyze_result.metrics.vulnerable,
-                "bypassable": analyze_result.metrics.bypassable,
-                "inconclusive": analyze_result.metrics.inconclusive,
-                "protected": analyze_result.metrics.protected,
-                "safe": analyze_result.metrics.safe,
-                "errors": analyze_result.metrics.errors,
-            },
-        }
-        ctx.outputs = {"results_path": analyze_result.results_path}
+    # newer_than=[active_dataset_path]: enhance has its own real
+    # checkpoint-resume and can rewrite this SAME path with NEW content on
+    # a resumed run (previously-incomplete units now finished) -- reusing a
+    # stale analyze result computed against the OLD content would be wrong.
+    # Also require `limit` to match: a stale result computed under a
+    # smaller --limit must not be reused as if it covered a larger request.
+    _prior_analyze = _load_completed_step(output_dir, "analyze", newer_than=[active_dataset_path])
+    if _prior_analyze is not None and (_prior_analyze.get("inputs") or {}).get("limit") != limit:
+        _prior_analyze = None
+
+    if _prior_analyze is not None:
+        print(_step_label("Running vulnerability detection (Stage 1)... (reusing completed run)"), file=sys.stderr)
+        _summary = _prior_analyze.get("summary") or {}
+        _verdicts = _summary.get("verdicts") or {}
+        analyze_result = AnalyzeResult(
+            results_path=(_prior_analyze.get("outputs") or {})["results_path"],
+            metrics=AnalysisMetrics(
+                total=_summary.get("total_units", 0),
+                vulnerable=_verdicts.get("vulnerable", 0),
+                bypassable=_verdicts.get("bypassable", 0),
+                inconclusive=_verdicts.get("inconclusive", 0),
+                protected=_verdicts.get("protected", 0),
+                safe=_verdicts.get("safe", 0),
+                errors=_verdicts.get("errors", 0),
+            ),
+        )
+        collected_step_reports.append(_prior_analyze)
+    else:
+        print(_step_label("Running vulnerability detection (Stage 1)..."), file=sys.stderr)
+
+        with step_context("analyze", output_dir, inputs={
+            "dataset_path": active_dataset_path,
+            "model": analyze_binding.model,
+            "provider": analyze_binding.provider_name,
+            "limit": limit,
+        }) as ctx:
+            analyze_result = run_analysis(
+                dataset_path=active_dataset_path,
+                output_dir=output_dir,
+                analyzer_output_path=parse_result.analyzer_output_path,
+                app_context_path=app_context_path,
+                repo_path=repo_path,
+                limit=limit,
+                registry=registry,
+                workers=workers,
+                backoff_seconds=backoff_seconds,
+            )
+
+            ctx.summary = {
+                "total_units": analyze_result.metrics.total,
+                "analyzed": analyze_result.metrics.total - analyze_result.metrics.errors,
+                "verdicts": {
+                    "vulnerable": analyze_result.metrics.vulnerable,
+                    "bypassable": analyze_result.metrics.bypassable,
+                    "inconclusive": analyze_result.metrics.inconclusive,
+                    "protected": analyze_result.metrics.protected,
+                    "safe": analyze_result.metrics.safe,
+                    "errors": analyze_result.metrics.errors,
+                },
+            }
+            ctx.outputs = {"results_path": analyze_result.results_path}
+
+        collected_step_reports.append(_load_step_report(output_dir, "analyze"))
 
     result.results_path = analyze_result.results_path
     result.metrics = analyze_result.metrics
-    collected_step_reports.append(_load_step_report(output_dir, "analyze"))
     print(file=sys.stderr)
 
     # Active results path — may be updated by verify step
@@ -772,6 +829,65 @@ def _load_step_report(output_dir: str, step: str) -> dict:
         return read_json(path)
     except Exception:
         return {"step": step, "status": "unknown"}
+
+
+def _load_completed_step(output_dir: str, step: str, newer_than: list[str] | None = None) -> dict | None:
+    """Returns the existing ``{step}.report.json`` if it records a genuine,
+    reusable success -- else None, meaning ``scan_repository`` should run
+    the step fresh.
+
+    ``output_dir`` is reused across resumes (same repo+commit -- see
+    AutoScan's ``openant_runner.py``, which keys its own output dirs on
+    repo+SHA precisely so a killed/interrupted wrapper can pick back up).
+    Before this existed, ``scan_repository`` unconditionally re-ran EVERY
+    step on every invocation regardless of what ``output_dir`` already had
+    in it -- confirmed live: a resumed scan re-parsed a Go repo from
+    scratch and was about to re-run ``analyze`` (which had already cost
+    over 1M tokens the first time) even though both had completed
+    successfully hours earlier.
+
+    Two conditions, not just ``status == "success"``: an OPTIONAL step
+    (app-context, currently the only one wired to reuse this) catches its
+    OWN exceptions internally and still exits with ``status == "success"``
+    but ``outputs == {}`` when it failed and skipped -- see the app-context
+    branch below. Requiring a non-empty ``outputs`` with every referenced
+    file still present on disk means a caught-internally failure is
+    correctly retried on resume, not mistaken for reusable success.
+
+    ``newer_than``: paths to this step's OWN inputs (e.g. analyze's
+    dataset). enhance has its own real checkpoint-resume, so it can
+    legitimately rewrite the SAME dataset path with NEW content on a
+    resumed run (previously-incomplete units now finished) -- reusing a
+    stale analyze result computed against the OLD content would be wrong
+    even though analyze itself completed successfully against what it saw
+    at the time. If any input has been modified since this report was
+    written, treat the step as needing a fresh run.
+    """
+    path = os.path.join(output_dir, f"{step}.report.json")
+    try:
+        report = read_json(path)
+    except Exception:
+        return None
+    if report.get("status") != "success":
+        return None
+    outputs = report.get("outputs") or {}
+    if not outputs:
+        return None
+    for value in outputs.values():
+        if isinstance(value, str) and not os.path.exists(value):
+            return None
+    if newer_than:
+        try:
+            report_mtime = os.path.getmtime(path)
+        except OSError:
+            return None
+        for input_path in newer_than:
+            try:
+                if os.path.getmtime(input_path) > report_mtime:
+                    return None
+            except OSError:
+                return None
+    return report
 
 
 def _read_app_type(app_context_path: str) -> str | None:

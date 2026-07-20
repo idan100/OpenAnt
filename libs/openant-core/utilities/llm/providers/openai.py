@@ -92,6 +92,27 @@ _OPENAI_FINISH_REASONS: dict[str, StopReason] = {
 # clean, finding-free pass.
 _OPENAI_CONTENT_FILTER_REASON = "content_filter"
 
+# ``finish_reason`` values that mean the provider itself reports the
+# completion as FAILED, not just unusually terminated — these must not
+# fall into the generic "unknown, normalise to end_turn" path, or a
+# real provider-side failure silently looks like a clean pass. Both are
+# treated as retryable (see ``is_retryable_error`` in
+# ``utilities/rate_limiter.py`` — matched by these exact substrings):
+# a fresh retry gets a NEW conversation, which (via PoolAdapter's
+# per-conversation stickiness) can land on a different candidate
+# entirely, often enough to route around a flaky/incompatible model.
+_OPENAI_ERROR_FINISH_REASONS = frozenset({"error", "tool_use_failed"})
+
+# Heuristic for a model that was OFFERED tools but ignored the native
+# tool-calling protocol and instead emitted pseudo-function-call syntax
+# as plain text — observed from weaker open-source models on some
+# free-tier pools (e.g. ``<function=search_usages{"function_name": "x"}
+# </function>``). Deliberately narrow (anchored on the literal
+# "<function=" / "</function>" markers actually observed) rather than a
+# broad "looks like JSON" check, to avoid false-positiving on a model
+# that legitimately explains code containing those substrings.
+_PSEUDO_TOOL_CALL_RE = re.compile(r"<function=|</function>")
+
 # OpenAI reasoning models (o1/o3/o4 families) reject ``max_tokens`` and
 # require ``max_completion_tokens``. Match the bare ``o<digit>`` family
 # — NOT ``gpt-4o`` / ``gpt-4o-mini``, which are regular chat models.
@@ -106,6 +127,12 @@ _warned_finish_reasons_lock = threading.Lock()
 # collapsing to an empty input dict (PR #69 H5). Per-process, lock-guarded.
 _warned_bad_tool_json: set[str] = set()
 _warned_bad_tool_json_lock = threading.Lock()
+
+# Tool NAMES the model has called that weren't in the offered ToolDef
+# list ("hallucinated" tools), keyed by name so a model/provider that
+# does this repeatedly is visible once rather than spamming stderr.
+_warned_hallucinated_tools: set[str] = set()
+_warned_hallucinated_tools_lock = threading.Lock()
 
 
 def _is_reasoning_model(model: str) -> bool:
@@ -139,12 +166,30 @@ def _warn_bad_tool_json(tool_name: str) -> None:
         )
 
 
+def _warn_hallucinated_tool(tool_name: str) -> None:
+    """One-time stderr warning when the model calls a tool we never offered."""
+    should_warn = False
+    with _warned_hallucinated_tools_lock:
+        if tool_name not in _warned_hallucinated_tools:
+            _warned_hallucinated_tools.add(tool_name)
+            should_warn = True
+    if should_warn:
+        sys.stderr.write(
+            f"warning: OpenAIAdapter received a tool call for {tool_name!r}, "
+            f"which was not in the offered tools list (hallucinated tool). "
+            f"The tool executor will return an 'unknown tool' error as the "
+            f"result, letting the model self-correct on its next turn.\n"
+        )
+
+
 def reset_warnings() -> None:
     """Clear this adapter's one-time-warning memory (for tests / new scans)."""
     with _warned_finish_reasons_lock:
         _warned_finish_reasons.clear()
     with _warned_bad_tool_json_lock:
         _warned_bad_tool_json.clear()
+    with _warned_hallucinated_tools_lock:
+        _warned_hallucinated_tools.clear()
 
 
 class OpenAIAdapter:
@@ -268,7 +313,7 @@ class OpenAIAdapter:
             # Everything else (5xx, unexpected statuses).
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
 
-        return _response_to_unified(response)
+        return _response_to_unified(response, tools)
 
     def validate(self, model: str) -> None:
         try:
@@ -346,12 +391,15 @@ def _messages_to_openai(
                 })
         elif message.role == "assistant":
             msg: dict[str, Any] = {"role": "assistant"}
-            # When an assistant message has tool_calls, OpenAI accepts
-            # content=null. When there's text alongside, send both.
-            if text_blocks:
-                msg["content"] = "\n".join(b.text for b in text_blocks)
-            else:
-                msg["content"] = None
+            # OpenAI itself accepts content=null alongside tool_calls,
+            # but not every OpenAI-COMPATIBLE provider does — confirmed
+            # against Cloudflare Workers AI (@cf/openai/gpt-oss-120b):
+            # it 400s with a schema "oneOf not met ... 'string' not in
+            # 'null'" on a null-content assistant message, and accepts
+            # "" instead. Empty string is accepted everywhere null is
+            # (both mean "no text alongside the tool call"), so using
+            # it unconditionally needs no per-provider branching.
+            msg["content"] = "\n".join(b.text for b in text_blocks) if text_blocks else ""
             if tool_use_blocks:
                 msg["tool_calls"] = [
                     {
@@ -383,8 +431,14 @@ def _tool_to_openai(tool: ToolDef) -> dict[str, Any]:
     }
 
 
-def _response_to_unified(response: Any) -> CompletionResult:
-    """Translate an OpenAI ChatCompletion response into our types."""
+def _response_to_unified(response: Any, tools: Optional[list[ToolDef]] = None) -> CompletionResult:
+    """Translate an OpenAI ChatCompletion response into our types.
+
+    ``tools`` is the SAME list the request was built with — passed
+    through purely for two resilience checks (tool-name validation and
+    pseudo-tool-call-syntax detection), never used to change what gets
+    sent. ``None``/empty behaves exactly as before this was added.
+    """
     choices = getattr(response, "choices", None) or []
     if not choices:
         # No choices → nothing the pipeline can act on. Surface it via
@@ -409,6 +463,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
     # Tool calls. The SDK exposes them as a list (or None) of objects
     # with .id, .type, .function.name, .function.arguments (string).
     tool_calls = getattr(message, "tool_calls", None) or []
+    offered_names = {t.name for t in tools} if tools else None
     for tc in tool_calls:
         arguments = getattr(tc.function, "arguments", "") or ""
         try:
@@ -421,9 +476,19 @@ def _response_to_unified(response: Any) -> CompletionResult:
             # multi-tool turn's other calls still proceed.
             _warn_bad_tool_json(getattr(tc.function, "name", "<unknown>"))
             input_dict = {}
+        tool_name = tc.function.name
+        if offered_names is not None and tool_name not in offered_names:
+            # A hallucinated tool: the model used the native tool-call
+            # mechanism correctly but named something we never offered.
+            # ToolExecutor already returns a clean "unknown tool" error
+            # as the tool_result (letting the model self-correct next
+            # turn) — this warning is purely visibility, so a pool
+            # member that hallucinates tools often is noticeable in
+            # logs rather than silently self-correcting forever.
+            _warn_hallucinated_tool(tool_name)
         content_blocks.append(ToolUseBlock(
             id=tc.id,
-            name=tc.function.name,
+            name=tool_name,
             input=input_dict,
         ))
 
@@ -437,6 +502,31 @@ def _response_to_unified(response: Any) -> CompletionResult:
             "OpenAI content-filtered the response "
             "(finish_reason='content_filter'); the completion was withheld "
             "or truncated by the moderation layer"
+        )
+
+    # A provider-reported failure state ("error" / "tool_use_failed")
+    # must not be silently normalised to a clean end_turn — see
+    # _OPENAI_ERROR_FINISH_REASONS. Raised as a plain LLMResponseError
+    # (not a refusal — nothing was filtered, the call itself failed) so
+    # it flows through the SAME retry path as any other transient
+    # error; is_retryable_error() matches on these literal substrings.
+    if raw_finish in _OPENAI_ERROR_FINISH_REASONS:
+        raise LLMResponseError(
+            f"OpenAI-compatible provider reported finish_reason={raw_finish!r} "
+            f"— the completion itself failed, not just an unusual termination"
+        )
+
+    # A model that was offered tools, made none of the native tool_calls,
+    # but emitted pseudo-function-call syntax as plain text instead —
+    # observed from weaker open-source models on some free-tier pools.
+    # Raised (not silently passed through as a TextBlock that later
+    # fails JSON parsing somewhere downstream with a confusing error)
+    # so it hits the same retryable-error path as finish_reason='error'.
+    if offered_names and not tool_calls and text and _PSEUDO_TOOL_CALL_RE.search(text):
+        raise LLMResponseError(
+            "OpenAI-compatible provider emitted pseudo-tool-call syntax as "
+            "plain text instead of using the native tool-calling mechanism "
+            "(malformed_tool_syntax)"
         )
 
     if raw_finish not in _OPENAI_FINISH_REASONS:

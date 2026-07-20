@@ -300,6 +300,44 @@ class LLMRefusalError(LLMResponseError):
     """
 
 
+def classify_llm_error(exc: BaseException) -> str:
+    """Bucket ``exc`` for checkpoint/summary error-breakdown tracking.
+
+    Both Stage 1 (``core/analyzer.py``) and Stage 2
+    (``utilities/finding_verifier.py``) previously lumped EVERY failure
+    — a 429, a dropped connection, a malformed provider response, an
+    outright bug in our own code — into one hardcoded ``"api"``
+    bucket, discarding the exception's actual type at the point it was
+    caught. The typed :class:`LLMError` hierarchy above already
+    distinguishes these; this just makes that distinction visible in
+    the per-scan summary instead of throwing it away.
+
+    Order matters: :class:`LLMRefusalError` is checked before its
+    parent :class:`LLMResponseError`, since ``isinstance`` would
+    otherwise match the broader class first.
+
+    Returns one of: ``"rate_limit"``, ``"connection"``, ``"auth"``,
+    ``"not_found"``, ``"refusal"``, ``"malformed_response"`` (any other
+    :class:`LLMResponseError` — covers provider-incompatible payloads,
+    provider-reported tool-call failures, pseudo-tool-call syntax
+    leakage), or ``"internal"`` (anything NOT part of the LLMError
+    taxonomy — a bug in pipeline code, not a provider problem).
+    """
+    if isinstance(exc, LLMRateLimitError):
+        return "rate_limit"
+    if isinstance(exc, LLMConnectionError):
+        return "connection"
+    if isinstance(exc, LLMAuthError):
+        return "auth"
+    if isinstance(exc, LLMNotFoundError):
+        return "not_found"
+    if isinstance(exc, LLMRefusalError):
+        return "refusal"
+    if isinstance(exc, LLMResponseError):
+        return "malformed_response"
+    return "internal"
+
+
 # ---------------------------------------------------------------------------
 # The adapter protocol
 # ---------------------------------------------------------------------------

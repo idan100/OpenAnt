@@ -416,7 +416,7 @@ def test_l4_adapter_raise_sets_result_error():
     downstream counter buckets it as error (never safe)."""
     verifier = _make_verifier(_RaisingAdapter())
     result = {"route_key": "app.py:boom", "finding": "vulnerable"}
-    route_key, detail, _elapsed, _worker, _usage = verifier._verify_one(
+    route_key, detail, _elapsed, _worker, _usage, error_type = verifier._verify_one(
         result, {"app.py:boom": "x = 1"}
     )
     assert detail == "error"
@@ -424,6 +424,7 @@ def test_l4_adapter_raise_sets_result_error():
         "an adapter raise must set result['error'] so verifier.py counts it as "
         "error, not disagreed→safe"
     )
+    assert error_type == "malformed_response"  # LLMResponseError
 
 
 def test_l4_errored_result_counted_as_error_not_safe():

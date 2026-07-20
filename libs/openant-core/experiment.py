@@ -310,6 +310,14 @@ def parse_response(response: str) -> dict:
 
     try:
         result = json.loads(response)
+        if not isinstance(result, dict):
+            # Valid JSON that ISN'T an object (a bare list/string/number
+            # — e.g. a model wrapping its answer as `[{"finding": ...}]`)
+            # parses without error, but _normalize_result's item
+            # assignments would then crash with a TypeError. Treat this
+            # exactly like a decode failure: fall through to the
+            # find-the-{-and-} recovery below, then the error dict.
+            raise json.JSONDecodeError("parsed JSON was not an object", response, 0)
         return _normalize_result(result)
     except json.JSONDecodeError as e:
         # Try to find JSON object in response
@@ -318,7 +326,8 @@ def parse_response(response: str) -> dict:
         if start >= 0 and end > start:
             try:
                 result = json.loads(response[start:end])
-                return _normalize_result(result)
+                if isinstance(result, dict):
+                    return _normalize_result(result)
             except json.JSONDecodeError:
                 pass
 

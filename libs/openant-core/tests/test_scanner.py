@@ -22,6 +22,7 @@ orchestration control-flow without real API/Docker calls.
 """
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -305,3 +306,229 @@ def test_skipped_step_reasons_serialized_in_scan_report(monkeypatch, tmp_path):
     # New disambiguated map present.
     assert "steps_skipped_reasons" in summary
     assert "verify" in summary["steps_skipped_reasons"]
+
+
+# ---------------------------------------------------------------------------
+# Phase-skip-on-resume: parse/app-context/analyze must NOT unconditionally
+# redo work that already completed successfully in output_dir -- confirmed
+# live (AutoScan session, 2026-07): a resumed scan re-parsed a Go repo from
+# scratch and was about to re-run analyze (which had already cost over 1M
+# tokens) even though both had completed successfully hours earlier.
+# ---------------------------------------------------------------------------
+
+def test_parse_is_skipped_when_already_complete(monkeypatch, tmp_path):
+    """A prior successful parse must not be re-parsed on a resumed call
+    against the same output_dir."""
+    _install_minimal_pipeline(monkeypatch)
+    out = tmp_path / "out"
+
+    first = scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=False, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False,
+    )
+    assert first.units_count == 3
+
+    import core.parser_adapter as parser_adapter
+
+    def _boom(**kwargs):
+        raise AssertionError("parse_repository should NOT be called -- parse already completed")
+
+    monkeypatch.setattr(parser_adapter, "parse_repository", _boom)
+
+    second = scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=False, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False,
+    )
+    assert second.units_count == 3
+    assert second.language == "python"
+
+
+def test_analyze_is_skipped_when_already_complete(monkeypatch, tmp_path):
+    """A prior successful analyze (with its dataset unchanged since) must
+    not be re-run on a resumed call -- also proves parse skip composes with
+    analyze skip (both reused on the second call)."""
+    _install_minimal_pipeline(monkeypatch, vulnerable=1)
+    out = tmp_path / "out"
+
+    first = scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=False, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False,
+    )
+    assert first.metrics.vulnerable == 1
+
+    import core.analyzer as analyzer
+    import core.parser_adapter as parser_adapter
+
+    def _boom(**kwargs):
+        raise AssertionError("should NOT be called -- already completed")
+
+    monkeypatch.setattr(analyzer, "run_analysis", _boom)
+    monkeypatch.setattr(parser_adapter, "parse_repository", _boom)
+
+    second = scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=False, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False,
+    )
+    assert second.metrics.vulnerable == 1
+    assert second.metrics.total == 3
+
+
+def test_analyze_reruns_if_dataset_changed_since(monkeypatch, tmp_path):
+    """If the dataset is modified after analyze last completed (e.g.
+    enhance's own checkpoint-resume finishing previously-incomplete units
+    on this invocation), the stale analyze result must NOT be reused."""
+    _install_minimal_pipeline(monkeypatch, vulnerable=0)
+    out = tmp_path / "out"
+
+    scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=False, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False,
+    )
+
+    # Simulate enhance rewriting the dataset with new content after analyze
+    # last ran -- bump mtime comfortably forward rather than sleeping.
+    dataset_path = out / "dataset.json"
+    dataset_path.write_text('{"units": [], "touched": true}')
+    future = time.time() + 5
+    import os
+    os.utime(dataset_path, (future, future))
+
+    import core.analyzer as analyzer
+    real_fake = analyzer.run_analysis
+    calls = {"n": 0}
+
+    def _counting_fake(**kwargs):
+        calls["n"] += 1
+        return real_fake(**kwargs)
+
+    monkeypatch.setattr(analyzer, "run_analysis", _counting_fake)
+
+    scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=False, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False,
+    )
+    assert calls["n"] == 1  # re-ran for real, was not skipped
+
+
+def test_analyze_reruns_if_limit_changed(monkeypatch, tmp_path):
+    """A stale analyze result computed under a different --limit must not
+    be reused as if it covered the current request."""
+    _install_minimal_pipeline(monkeypatch, vulnerable=0)
+    out = tmp_path / "out"
+
+    scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=False, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False, limit=5,
+    )
+
+    import core.analyzer as analyzer
+    real_fake = analyzer.run_analysis
+    calls = {"n": 0}
+
+    def _counting_fake(**kwargs):
+        calls["n"] += 1
+        return real_fake(**kwargs)
+
+    monkeypatch.setattr(analyzer, "run_analysis", _counting_fake)
+
+    scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=False, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False, limit=10,
+    )
+    assert calls["n"] == 1  # re-ran for real, was not skipped
+
+
+def test_app_context_is_skipped_when_already_complete(monkeypatch, tmp_path):
+    """A prior successful app-context generation must not be redone on a
+    resumed call."""
+    _install_minimal_pipeline(monkeypatch)
+
+    class _FakeContext:
+        application_type = "cli_tool"
+
+    calls = {"n": 0}
+
+    def _fake_generate(*a, **k):
+        calls["n"] += 1
+        return _FakeContext()
+
+    def _fake_save(context, path):
+        Path(path).write_text('{"application_type": "cli_tool"}')
+
+    monkeypatch.setattr(scanner_mod, "HAS_APP_CONTEXT", True)
+    monkeypatch.setattr(scanner_mod, "generate_application_context", _fake_generate)
+    monkeypatch.setattr(scanner_mod, "save_context", _fake_save)
+
+    out = tmp_path / "out"
+    first = scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=True, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False,
+    )
+    assert calls["n"] == 1
+    assert first.app_context_path is not None
+
+    def _boom(*a, **k):
+        raise AssertionError("generate_application_context should NOT be called again")
+
+    monkeypatch.setattr(scanner_mod, "generate_application_context", _boom)
+
+    second = scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=True, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False,
+    )
+    assert calls["n"] == 1  # unchanged -- reused, generate was not called again
+    assert second.app_context_path == first.app_context_path
+
+
+def test_app_context_failure_is_retried_not_reused(monkeypatch, tmp_path):
+    """An app-context step that caught its OWN exception internally still
+    writes status=='success' with EMPTY outputs (see step_context's
+    try/except-and-continue pattern for optional stages) -- that must be
+    retried on resume, not mistaken for a reusable success."""
+    _install_minimal_pipeline(monkeypatch)
+
+    calls = {"n": 0}
+
+    def _fails_once_then_succeeds(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient failure")
+
+        class _FakeContext:
+            application_type = "cli_tool"
+
+        return _FakeContext()
+
+    def _fake_save(context, path):
+        Path(path).write_text('{"application_type": "cli_tool"}')
+
+    monkeypatch.setattr(scanner_mod, "HAS_APP_CONTEXT", True)
+    monkeypatch.setattr(scanner_mod, "generate_application_context", _fails_once_then_succeeds)
+    monkeypatch.setattr(scanner_mod, "save_context", _fake_save)
+
+    out = tmp_path / "out"
+    first = scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=True, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False,
+    )
+    assert calls["n"] == 1
+    assert first.app_context_path is None  # caught internally, no context produced
+
+    second = scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=True, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False,
+    )
+    assert calls["n"] == 2  # retried, NOT mistaken for a reusable success
+    assert second.app_context_path is not None

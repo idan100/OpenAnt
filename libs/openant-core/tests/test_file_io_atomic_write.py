@@ -40,3 +40,72 @@ def test_write_json_normal_roundtrip(tmp_path):
     p = tmp_path / "x.json"
     write_json(p, {"a": [1, 2, 3], "b": "héllo"})
     assert read_json(p) == {"a": [1, 2, 3], "b": "héllo"}
+
+
+# ---------------------------------------------------------------------------
+# Windows WinError 5 (PermissionError) on os.replace() — a concurrent
+# reader/scanner briefly holding the target open. Retries a few times
+# with backoff before giving up, Windows-only (POSIX rename doesn't
+# have this failure mode).
+# ---------------------------------------------------------------------------
+
+
+def test_replace_retries_and_succeeds_on_windows(monkeypatch):
+    monkeypatch.setattr(fio.sys, "platform", "win32")
+    monkeypatch.setattr(fio.time, "sleep", lambda _: None)  # keep the test instant
+    calls = {"n": 0}
+
+    def flaky_replace(tmp, target):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError("WinError 5: Access is denied")
+
+    monkeypatch.setattr(fio.os, "replace", flaky_replace)
+    fio._replace_with_windows_retry("tmp", "target")
+    assert calls["n"] == 3, "must retry through the transient PermissionError and then succeed"
+
+
+def test_replace_gives_up_after_exhausting_retries_on_windows(monkeypatch):
+    monkeypatch.setattr(fio.sys, "platform", "win32")
+    monkeypatch.setattr(fio.time, "sleep", lambda _: None)
+
+    def always_fails(tmp, target):
+        raise PermissionError("WinError 5: Access is denied")
+
+    monkeypatch.setattr(fio.os, "replace", always_fails)
+    with pytest.raises(PermissionError):
+        fio._replace_with_windows_retry("tmp", "target")
+
+
+def test_replace_does_not_retry_on_non_windows(monkeypatch):
+    monkeypatch.setattr(fio.sys, "platform", "linux")
+    calls = {"n": 0}
+
+    def always_fails(tmp, target):
+        calls["n"] += 1
+        raise PermissionError("some other permission issue")
+
+    monkeypatch.setattr(fio.os, "replace", always_fails)
+    with pytest.raises(PermissionError):
+        fio._replace_with_windows_retry("tmp", "target")
+    assert calls["n"] == 1, "POSIX rename doesn't have this failure mode -- must not retry"
+
+
+def test_write_json_end_to_end_survives_transient_windows_permission_error(tmp_path, monkeypatch):
+    """The full write_json() path, not just the retry helper in isolation."""
+    monkeypatch.setattr(fio.sys, "platform", "win32")
+    monkeypatch.setattr(fio.time, "sleep", lambda _: None)
+    p = tmp_path / "checkpoint.json"
+    real_replace = fio.os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(tmp, target):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise PermissionError("WinError 5: Access is denied")
+        real_replace(tmp, target)
+
+    monkeypatch.setattr(fio.os, "replace", flaky_replace)
+    write_json(p, {"v": 1})
+    assert read_json(p) == {"v": 1}
+    assert calls["n"] == 2

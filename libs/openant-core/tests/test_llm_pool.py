@@ -129,12 +129,16 @@ class TestPoolAdapter:
         assert result.content[0].text == "from-vendor1"
         assert adapters[0].complete_calls == []
 
-    def test_falls_through_to_busy_candidate_if_all_busy(self):
+    def test_falls_through_to_busy_candidate_if_all_busy(self, monkeypatch):
+        import utilities.llm.providers.pool as pool_module
+
+        monkeypatch.setattr(pool_module.time, "sleep", lambda _: None)
         pool, adapters = self._pool(2)
         rl.get_rate_limiter("vendor0").report_rate_limit(60.0)
         rl.get_rate_limiter("vendor1").report_rate_limit(60.0)
         # Both busy — still succeeds by trying one of them anyway
-        # rather than refusing outright.
+        # rather than refusing outright (after the central "everyone's
+        # busy" wait exhausts its bounded rounds, per _MAX_CENTRAL_WAIT_ROUNDS).
         result = pool.complete(model="x", system=None, messages=[], max_tokens=8)
         assert result.content[0].text in ("from-vendor0", "from-vendor1")
 
@@ -145,6 +149,66 @@ class TestPoolAdapter:
         pool._next_index = 0
         result = pool.complete(model="x", system=None, messages=[], max_tokens=8)
         assert result.content[0].text == "from-vendor1"
+
+    # -----------------------------------------------------------------
+    # "Everyone busy" central wait: when every candidate is currently
+    # rate-limited/out-of-slots, don't commit to trying them in fixed
+    # rotation order (which just means blocking on whichever one the
+    # rotation lands on first) — check who clears soonest and sleep
+    # exactly that long, then re-evaluate from scratch.
+    # -----------------------------------------------------------------
+
+    def test_waits_for_the_soonest_candidate_not_rotation_order(self):
+        import time as time_module
+
+        pool, adapters = self._pool(2)
+        # vendor0 has the LONGER backoff, vendor1 the shorter one.
+        # Rotation starts at vendor0 (index 0) — the old behavior would
+        # commit to trying vendor0 first regardless. Set _backoff_until
+        # directly rather than via report_rate_limit(), which clamps to
+        # max(given, the limiter's own 30s default) -- both of these
+        # short durations would otherwise silently become 30s.
+        now = time_module.monotonic()
+        rl.get_rate_limiter("vendor0")._backoff_until = now + 2.0
+        rl.get_rate_limiter("vendor1")._backoff_until = now + 0.1
+        pool._next_index = 0
+
+        result = pool.complete(model="x", system=None, messages=[], max_tokens=8)
+
+        # The pool waited for the SOONER candidate (vendor1, ~0.1s) and
+        # got it, rather than blocking on vendor0's longer 2s backoff.
+        assert result.content[0].text == "from-vendor1"
+
+    def test_does_not_sleep_when_soonest_wait_exceeds_threshold(self, monkeypatch):
+        import utilities.llm.providers.pool as pool_module
+
+        slept = []
+        monkeypatch.setattr(pool_module.time, "sleep", lambda s: slept.append(s))
+        pool, adapters = self._pool(2)
+        # Both candidates busy for well over _MAX_CENTRAL_WAIT_SECONDS —
+        # must fall straight through to best-effort dispatch, no central wait.
+        rl.get_rate_limiter("vendor0").report_rate_limit(120.0)
+        rl.get_rate_limiter("vendor1").report_rate_limit(120.0)
+
+        result = pool.complete(model="x", system=None, messages=[], max_tokens=8)
+
+        assert result.content[0].text in ("from-vendor0", "from-vendor1")
+        assert slept == [], "must not sleep centrally when nothing clears within the threshold"
+
+    def test_gives_up_after_bounded_rounds_if_backoff_never_actually_clears(self, monkeypatch):
+        import utilities.llm.providers.pool as pool_module
+
+        # Sleep is a no-op, so real time never actually advances --
+        # backoff never clears no matter how many rounds run. Must
+        # still terminate (not hang) and fall through to dispatch.
+        monkeypatch.setattr(pool_module.time, "sleep", lambda _: None)
+        pool, adapters = self._pool(2)
+        rl.get_rate_limiter("vendor0").report_rate_limit(1.0)
+        rl.get_rate_limiter("vendor1").report_rate_limit(1.0)
+
+        result = pool.complete(model="x", system=None, messages=[], max_tokens=8)
+
+        assert result.content[0].text in ("from-vendor0", "from-vendor1")
 
     def test_raises_when_every_candidate_rate_limited(self):
         pool, adapters = self._pool(2)
@@ -227,6 +291,69 @@ class TestPoolAdapter:
         assert results["a"][0] == results["a"][1]
         assert results["b"][0] == results["b"][1]
 
+    # -----------------------------------------------------------------
+    # Context-window routing: a candidate with a known per-request token
+    # ceiling (e.g. GitHub Models' 8k-token "Low" tier) is skipped in
+    # favor of a candidate without one, rather than 413ing.
+    # -----------------------------------------------------------------
+
+    def test_skips_candidate_whose_known_ceiling_the_request_exceeds(self, monkeypatch):
+        import utilities.token_estimate as te
+
+        pool, adapters = self._pool(2)
+        # vendor0/model0 has a tiny known ceiling; vendor1/model1 has none.
+        monkeypatch.setitem(te.KNOWN_MAX_REQUEST_TOKENS, ("vendor0", "model0"), 10)
+        big_text = "x" * 1000  # ~250 estimated tokens, well over the 10-token ceiling
+        pool._next_index = 0
+        result = pool.complete(
+            model="ignored", system=None,
+            messages=[Message(role="user", content=[TextBlock(big_text)])],
+            max_tokens=8,
+        )
+        assert result.content[0].text == "from-vendor1"
+        assert adapters[0].complete_calls == [], "the oversized candidate must never even be tried"
+
+    def test_uses_candidate_with_known_ceiling_when_request_fits(self, monkeypatch):
+        import utilities.token_estimate as te
+
+        pool, adapters = self._pool(2)
+        monkeypatch.setitem(te.KNOWN_MAX_REQUEST_TOKENS, ("vendor0", "model0"), 10_000)
+        pool._next_index = 0
+        result = pool.complete(
+            model="ignored", system=None,
+            messages=[Message(role="user", content=[TextBlock("small request")])],
+            max_tokens=8,
+        )
+        assert result.content[0].text == "from-vendor0"
+
+    def test_tries_oversized_candidate_as_absolute_last_resort(self, monkeypatch):
+        """If EVERY candidate is oversized (or busy), still try one rather
+        than erroring outright — matches the existing "busy" fallthrough
+        philosophy (some chance beats none)."""
+        import utilities.token_estimate as te
+
+        pool, adapters = self._pool(1)
+        monkeypatch.setitem(te.KNOWN_MAX_REQUEST_TOKENS, ("vendor0", "model0"), 1)
+        result = pool.complete(
+            model="ignored", system=None,
+            messages=[Message(role="user", content=[TextBlock("x" * 1000)])],
+            max_tokens=8,
+        )
+        assert result.content[0].text == "from-vendor0"
+
+    def test_no_known_ceiling_means_no_size_based_skipping(self):
+        # No entry in KNOWN_MAX_REQUEST_TOKENS for either candidate ->
+        # behaves exactly like the plain round-robin tests, regardless
+        # of request size.
+        pool, adapters = self._pool(2)
+        pool._next_index = 0
+        result = pool.complete(
+            model="ignored", system=None,
+            messages=[Message(role="user", content=[TextBlock("x" * 100_000)])],
+            max_tokens=8,
+        )
+        assert result.content[0].text == "from-vendor0"
+
     def test_supports_tools_requires_all_members(self):
         good = _FakeAdapter("a")
         bad = _FakeNoToolAdapter("b")
@@ -237,16 +364,33 @@ class TestPoolAdapter:
         pool, _ = self._pool(2)
         assert pool.name == "vendor0+vendor1"
 
-    def test_pricing_merges_all_members(self):
+    def test_pricing_looks_up_whichever_candidate_has_the_model(self):
         a = _FakeAdapter("a")
         a.pricing = {"model-a": {"input": 1.0, "output": 2.0}}
         b = _FakeAdapter("b")
         b.pricing = {"model-b": {"input": 3.0, "output": 4.0}}
         pool = PoolAdapter(candidates=[(a, "model-a", "a"), (b, "model-b", "b")], phase="analyze")
-        assert pool.pricing == {
-            "model-a": {"input": 1.0, "output": 2.0},
-            "model-b": {"input": 3.0, "output": 4.0},
-        }
+        assert pool.pricing.get("model-a") == {"input": 1.0, "output": 2.0}
+        assert pool.pricing.get("model-b") == {"input": 3.0, "output": 4.0}
+        assert pool.pricing.get("unknown-model") is None
+
+    def test_pricing_respects_a_candidate_with_custom_get_override(self):
+        """The whole point of the fix: a candidate whose .pricing is a
+        dict SUBCLASS with custom .get() behavior (like claude_sub's
+        _ZeroCostPricing, which reports $0 for ANY key via an override
+        rather than real stored items) must not be silently dropped by
+        an eager dict.update() merge — see the PoolAdapter.pricing
+        docstring."""
+        class _AlwaysZeroPricing(dict):
+            def get(self, key, default=None):
+                return {"input": 0.0, "output": 0.0}
+
+        zero_cost = _FakeAdapter("claude_sub")
+        zero_cost.pricing = _AlwaysZeroPricing()
+        other = _FakeAdapter("b")
+        other.pricing = {"model-b": {"input": 3.0, "output": 4.0}}
+        pool = PoolAdapter(candidates=[(zero_cost, "opus", "claude_sub"), (other, "model-b", "b")], phase="analyze")
+        assert pool.pricing.get("opus") == {"input": 0.0, "output": 0.0}
 
     def test_validate_succeeds_if_at_least_one_member_ok(self):
         pool, adapters = self._pool(2)

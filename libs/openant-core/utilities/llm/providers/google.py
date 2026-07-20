@@ -159,6 +159,33 @@ def _build_gemini_refusal_set() -> frozenset[str]:
 
 _GEMINI_REFUSAL_FINISH_REASONS = _build_gemini_refusal_set()
 
+# Gemini's tool-calling failure states — the model tried to call a
+# function but the call itself is broken (MALFORMED_FUNCTION_CALL) or
+# came out of turn (UNEXPECTED_TOOL_CALL). These are provider-reported
+# FAILURES, not just unusual terminations, so — like the refusal set
+# above — they must not fall into the generic "unknown finish_reason,
+# normalise to end_turn" path. Raised as LLMResponseError (not a
+# refusal — nothing was filtered) with a message matched by
+# is_retryable_error()'s substring check in utilities/rate_limiter.py.
+_GEMINI_TOOL_ERROR_NAMES = ("MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")
+
+
+def _build_gemini_tool_error_set() -> frozenset[str]:
+    names: set[str] = set()
+    finish_enum = getattr(genai_types, "FinishReason", None)
+    for name in _GEMINI_TOOL_ERROR_NAMES:
+        names.add(name)
+        member = getattr(finish_enum, name, None) if finish_enum is not None else None
+        if member is not None:
+            names.add(str(member))
+            value = getattr(member, "value", None)
+            if value is not None:
+                names.add(str(value))
+    return frozenset(names)
+
+
+_GEMINI_TOOL_ERROR_FINISH_REASONS = _build_gemini_tool_error_set()
+
 _warned_finish_reasons: set[str] = set()
 _warned_finish_reasons_lock = threading.Lock()
 
@@ -243,12 +270,27 @@ class GoogleAdapter:
         if api_key is not None:
             kwargs["api_key"] = api_key
 
-        # Build HttpOptions whenever we need to set base_url and/or
-        # retry_options. The SDK takes both on the same object, so we
-        # assemble one set of fields and only construct it if non-empty —
-        # passing an empty HttpOptions would needlessly override the SDK
-        # defaults. ``max_retries`` maps to ``HttpRetryOptions.attempts``.
-        http_options_fields: dict[str, Any] = {}
+        # Build HttpOptions with base_url/retry_options/timeout all on
+        # the one object the SDK expects them on. ``max_retries`` maps
+        # to ``HttpRetryOptions.attempts``.
+        #
+        # ``timeout`` is ALWAYS set (unlike base_url/retry_options,
+        # which stay conditional) because the SDK's own default is
+        # unset -- confirmed against the pinned google-genai v2.4.0:
+        # ``HttpOptions.timeout`` defaults to ``None``, which the SDK
+        # passes straight through to httpx's ``timeout=`` parameter.
+        # httpx treats an EXPLICIT ``None`` there as "disable all
+        # timeouts", not "use httpx's own 5s default" — so an unset
+        # Google client can hang literally forever on a stalled
+        # connection or a very slow generation, with no client-side
+        # bound at all. Observed in practice: an app_context call sat
+        # for 220+ seconds with zero progress until manually
+        # interrupted. Anthropic's and OpenAI's SDKs both default to a
+        # 600s read timeout (verified: ``Timeout(connect=5.0,
+        # read=600, ...)``); matching that here for consistency rather
+        # than inventing a different number. Units are MILLISECONDS
+        # (``HttpOptions.timeout`` — verified in the SDK source).
+        http_options_fields: dict[str, Any] = {"timeout": 600_000}
         if base_url is not None:
             http_options_fields["base_url"] = base_url
         if max_retries is not None:
@@ -624,6 +666,12 @@ def _response_to_unified(response: Any) -> CompletionResult:
         raise LLMRefusalError(
             f"Gemini blocked the response (finish_reason={raw_finish!r}); "
             "the candidate was withheld for safety or policy reasons"
+        )
+
+    if raw_finish in _GEMINI_TOOL_ERROR_FINISH_REASONS:
+        raise LLMResponseError(
+            f"Gemini reported finish_reason={raw_finish!r} — the tool call "
+            f"itself failed or was malformed, not just an unusual termination"
         )
 
     stop_reason: StopReason

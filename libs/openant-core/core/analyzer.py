@@ -31,6 +31,7 @@ from utilities.llm import (
     PhaseBinding,
     PhaseRegistry,
     build_phase_registry,
+    classify_llm_error,
     effective_worker_count,
     load_config_file,
     resolve_llm_config,
@@ -119,6 +120,41 @@ def _apply_limit(units, limit):
     return prioritized[:limit]
 
 
+def _retry_attempts(retryable_indices: list) -> list[tuple[int, int]]:
+    """Pair each retryable unit's ORIGINAL index with a sequential
+    1-based attempt number, for progress logging.
+
+    ``retryable_indices`` holds original positions in the full unit
+    list (e.g. ``[3, 8, 18, 26]`` out of a 30-unit scan) — using one of
+    those AS the attempt number against a denominator of "how many
+    units need retrying" produced nonsensical progress lines like
+    "Retry 19/10" (unit #18, 1-indexed, printed against a total of 10
+    retryable units). The attempt number must count 1..N over this
+    retry pass, independent of what the original unit indices are.
+    """
+    return list(enumerate(retryable_indices, start=1))
+
+
+def _reclassify_error_breakdown(breakdown: dict, old_bucket: str, new_bucket: str | None) -> None:
+    """Move a retried unit's error-breakdown count from ``old_bucket``
+    to ``new_bucket`` (or drop it entirely if ``new_bucket`` is
+    ``None`` — the retry succeeded). Mutates ``breakdown`` in place.
+
+    A retry that still fails can RECLASSIFY (e.g. a ``connection``
+    error on attempt 1 lands on a different pool candidate on retry
+    and comes back ``malformed_response``) — without this, the
+    breakdown's per-category counts drift away from
+    ``_summary_errors`` (the total) the moment any retry changes a
+    unit's outcome.
+    """
+    if breakdown.get(old_bucket, 0) > 0:
+        breakdown[old_bucket] -= 1
+        if breakdown[old_bucket] == 0:
+            del breakdown[old_bucket]
+    if new_bucket is not None:
+        breakdown[new_bucket] = breakdown.get(new_bucket, 0) + 1
+
+
 def _process_unit(binding: PhaseBinding, unit, index, json_corrector, app_context):
     """Process a single unit for Stage 1 detection.
 
@@ -171,6 +207,16 @@ def _process_unit(binding: PhaseBinding, unit, index, json_corrector, app_contex
     except Exception as e:
         elapsed = time.monotonic() - start
         worker = threading.current_thread().name
+        # See utilities/llm/adapter.py:classify_llm_error — buckets by
+        # the exception's ACTUAL type (rate_limit/connection/auth/
+        # not_found/refusal/malformed_response/internal) rather than
+        # the single hardcoded "api" every error used to collapse into,
+        # so a scan's summary shows WHAT kind of failures happened, not
+        # just that some did. Stored on BOTH the inner result dict
+        # (survives into checkpoints, read back on resume) and the
+        # outer dict (read directly by _run_detection's summary_callback
+        # call sites, which never see `result`).
+        error_type = classify_llm_error(e)
         return {
             "index": index,
             "result": {
@@ -178,12 +224,14 @@ def _process_unit(binding: PhaseBinding, unit, index, json_corrector, app_contex
                 "verdict": "ERROR",
                 "finding": "error",
                 "error": str(e),
+                "error_type": error_type,
             },
             "route_key": uid,
             "code_for_route": "",
             "finding": "error",
             "elapsed": elapsed,
             "error": str(e),
+            "error_type": error_type,
             "worker": worker,
             "usage": tracker.get_unit_usage(),
         }
@@ -267,7 +315,7 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
                 results[i] = out["result"]
                 code_by_route[out["route_key"]] = out["code_for_route"]
                 if summary_callback:
-                    summary_callback(out["finding"], usage=out.get("usage"))
+                    summary_callback(out["finding"], usage=out.get("usage"), error_type=out.get("error_type"))
                 progress.report(
                     out["result"].get("unit_id", f"unit_{i}"),
                     detail=out["finding"],
@@ -293,7 +341,7 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
             results[idx] = out["result"]
             code_by_route[out["route_key"]] = out["code_for_route"]
             if summary_callback:
-                summary_callback(out["finding"], usage=out.get("usage"))
+                summary_callback(out["finding"], usage=out.get("usage"), error_type=out.get("error_type"))
             worker = out.get("worker", "?")
             progress.report(
                 out["result"].get("unit_id", f"unit_{idx}"),
@@ -485,7 +533,11 @@ def run_analysis(
         _r = _cp.get("result", {})
         if _r.get("verdict") == "ERROR" or _r.get("finding") == "error":
             _summary_errors += 1
-            _summary_error_breakdown["api"] = _summary_error_breakdown.get("api", 0) + 1
+            # "api" is the fallback for a checkpoint written before this
+            # classification existed (no error_type stored yet) — not a
+            # real category, just "we don't know, it's from an old run".
+            _bucket = _r.get("error_type") or "api"
+            _summary_error_breakdown[_bucket] = _summary_error_breakdown.get(_bucket, 0) + 1
         else:
             _summary_completed += 1
         _cp_usage = _cp.get("usage", {})
@@ -508,13 +560,14 @@ def run_analysis(
                              _summary_error_breakdown, phase="in_progress",
                              usage=_usage_dict())
 
-    def _summary_callback(finding, usage=None):
+    def _summary_callback(finding, usage=None, error_type=None):
         """Update summary counters after each unit. Called from main thread."""
         nonlocal _summary_completed, _summary_errors, _summary_error_breakdown
         nonlocal _summary_input_tokens, _summary_output_tokens, _summary_cost_usd
         if finding == "error":
             _summary_errors += 1
-            _summary_error_breakdown["api"] = _summary_error_breakdown.get("api", 0) + 1
+            _bucket = error_type or "api"
+            _summary_error_breakdown[_bucket] = _summary_error_breakdown.get(_bucket, 0) + 1
         else:
             _summary_completed += 1
         if usage:
@@ -548,16 +601,25 @@ def run_analysis(
                   file=sys.stderr)
 
         # Retry sequentially to avoid re-triggering rate limit
-        for i in retryable_indices:
+        for attempt, i in _retry_attempts(retryable_indices):
             unit = units[i]
+            old_bucket = ((results[i] or {}).get("error_type")) or "api"
             out = _process_unit(binding, unit, i, json_corrector, app_context)
             results[i] = out["result"]
             code_by_route[out["route_key"]] = out["code_for_route"]
 
-            # Update summary: retry succeeded → flip error to completed
+            # Update summary: retry succeeded → flip error to completed.
+            # Either way the original error's bucket count is stale the
+            # moment this unit is re-processed — see
+            # _reclassify_error_breakdown's docstring for why a still-
+            # failing retry can land in a DIFFERENT bucket too.
             if out["finding"] != "error":
+                _reclassify_error_breakdown(_summary_error_breakdown, old_bucket, None)
                 _summary_errors = max(0, _summary_errors - 1)
                 _summary_completed += 1
+            else:
+                new_bucket = out.get("error_type") or "api"
+                _reclassify_error_breakdown(_summary_error_breakdown, old_bucket, new_bucket)
             retry_usage = out.get("usage", {})
             _summary_input_tokens += retry_usage.get("input_tokens", 0)
             _summary_output_tokens += retry_usage.get("output_tokens", 0)
@@ -578,7 +640,7 @@ def run_analysis(
                     cp_data["usage"] = out["usage"]
                 checkpoint.save(uid, cp_data)
 
-            print(f"  Retry {i+1}/{len(retryable_indices)}: {out['finding']} (retry)",
+            print(f"  Retry {attempt}/{len(retryable_indices)}: {out['finding']} (retry)",
                   file=sys.stderr, flush=True)
 
     # Write final summary with phase="done"

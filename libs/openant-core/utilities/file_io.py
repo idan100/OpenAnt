@@ -9,11 +9,39 @@ explicitly, preventing ``'charmap' codec can't decode byte ...`` errors.
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import time
 from typing import Any, Union
 
 # Accept str, Path, or any os.PathLike
 PathLike = Union[str, os.PathLike]
+
+# Windows' os.replace() onto a path another handle currently has open
+# (a concurrent reader via read_json/StepCheckpoint.status(), antivirus
+# scanning the just-written temp file, cloud-sync software) raises
+# PermissionError (WinError 5) -- unlike POSIX rename, which is atomic
+# and permissive of exactly this. The window is normally milliseconds,
+# so a short retry-with-backoff clears it without masking a genuinely
+# locked file (which still raises once the budget is exhausted).
+_WINDOWS_REPLACE_RETRIES = 5
+_WINDOWS_REPLACE_BACKOFF_SECONDS = 0.05  # doubles each retry
+
+
+def _replace_with_windows_retry(tmp: PathLike, target: PathLike) -> None:
+    if sys.platform != "win32":
+        os.replace(tmp, target)
+        return
+    delay = _WINDOWS_REPLACE_BACKOFF_SECONDS
+    for attempt in range(_WINDOWS_REPLACE_RETRIES):
+        try:
+            os.replace(tmp, target)
+            return
+        except PermissionError:
+            if attempt == _WINDOWS_REPLACE_RETRIES - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2
 
 
 def open_utf8(path: PathLike, mode: str = "r", **kwargs):
@@ -53,7 +81,7 @@ def write_json(path: PathLike, data: Any, **kwargs) -> None:
             json.dump(data, f, **kwargs)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, target)
+        _replace_with_windows_retry(tmp, target)
     except BaseException:
         try:
             os.unlink(tmp)
